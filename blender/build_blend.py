@@ -150,6 +150,16 @@ def normalise_subject(bpy, objects: list, target_size: float = 2.0) -> object:
         obj.select_set(True)
     bpy.context.view_layer.objects.active = meshes[0]
 
+    # glTF arrives parented to a root empty that carries the Y-up to Z-up
+    # conversion. Everything below reasons in world space, but `location` is
+    # parent-relative - so the parent has to go first, or the centring lands in
+    # the wrong place on exactly the highest-quality path.
+    if any(o.parent for o in meshes):
+        try:
+            bpy.ops.object.parent_clear(type="CLEAR_KEEP_TRANSFORM")
+        except Exception as exc:
+            print(f"WARN: parent_clear failed: {exc}", file=sys.stderr)
+
     if len(meshes) > 1:
         bpy.ops.object.join()
     subject = bpy.context.view_layer.objects.active
@@ -180,13 +190,19 @@ def normalise_subject(bpy, objects: list, target_size: float = 2.0) -> object:
     subject.location.z -= mins[2]
     bpy.ops.object.transform_apply(location=True, rotation=False, scale=False)
 
-    # Shade smooth with autosmooth-style creasing where the API allows.
-    bpy.ops.object.shade_smooth()
+    # Smooth the curved surfaces but keep the silhouette crisp. Blender 4.1
+    # replaced mesh auto-smooth with this operator; on anything older, fall
+    # back to plain smooth shading, which melts hard edges but still beats the
+    # faceted look of a raw grid.
     try:
-        bpy.ops.object.modifier_add(type="WEIGHTED_NORMAL")
-        subject.modifiers[-1].keep_sharp = True
+        bpy.ops.object.shade_auto_smooth(angle=math.radians(50))
     except Exception:
-        pass
+        bpy.ops.object.shade_smooth()
+        try:
+            bpy.ops.object.modifier_add(type="WEIGHTED_NORMAL")
+            subject.modifiers[-1].keep_sharp = True
+        except Exception:
+            pass
 
     return subject
 
@@ -303,29 +319,51 @@ def build_camera(bpy, scene_json: dict, subject) -> object:
     )
     dims = [maxs[i] - mins[i] for i in range(3)]
     extent = max(max(dims), 1e-3)
-    radius = max(0.5 * math.sqrt(sum(d * d for d in dims)), 1e-3)
 
-    # Fit the subject's bounding sphere inside whichever FOV is tighter.
     # Blender's AUTO sensor fit maps sensor_width to the longer image axis.
     scene = bpy.context.scene
     res_x = max(1, scene.render.resolution_x)
     res_y = max(1, scene.render.resolution_y)
     sensor = data.sensor_width or 36.0
-    half_major = math.atan((sensor / 2.0) / focal)
+    tan_major = (sensor / 2.0) / focal
     minor_ratio = (res_y / res_x) if res_x >= res_y else (res_x / res_y)
-    half_minor = math.atan(math.tan(half_major) * minor_ratio)
-    half_fov = max(min(half_major, half_minor), 1e-3)
-
-    distance = (radius * margin) / max(math.sin(half_fov), 1e-3)
-    distance = max(distance, extent * 0.75)
+    tan_minor = tan_major * minor_ratio
+    if res_x >= res_y:
+        tan_h, tan_v = tan_major, tan_minor
+    else:
+        tan_h, tan_v = tan_minor, tan_major
+    # Margin as headroom around the subject rather than extra distance.
+    tan_h = max(tan_h / margin, 1e-3)
+    tan_v = max(tan_v / margin, 1e-3)
 
     azimuth = math.radians(-35.0)
     elev = math.radians(elevation)
-    cam.location = (
-        centre.x + distance * math.cos(elev) * math.sin(azimuth),
-        centre.y - distance * math.cos(elev) * math.cos(azimuth),
-        centre.z + distance * math.sin(elev),
+    offset = mathutils.Vector(
+        (math.cos(elev) * math.sin(azimuth), -math.cos(elev) * math.cos(azimuth), math.sin(elev))
     )
+
+    # Fit the eight bounding-box corners, not the bounding sphere around them.
+    # A sphere is the box's diagonal - for a 2m subject that is 3.4m of framing,
+    # and the asset ends up half the height of its own preview.
+    forward = -offset
+    world_up = mathutils.Vector((0.0, 0.0, 1.0))
+    right = forward.cross(world_up)
+    right = right.normalized() if right.length > 1e-6 else mathutils.Vector((1.0, 0.0, 0.0))
+    up = right.cross(forward).normalized()
+
+    distance = extent * 0.75
+    for cx in (mins[0], maxs[0]):
+        for cy in (mins[1], maxs[1]):
+            for cz in (mins[2], maxs[2]):
+                v = mathutils.Vector((cx, cy, cz)) - centre
+                depth = v.dot(forward)
+                distance = max(
+                    distance,
+                    abs(v.dot(right)) / tan_h - depth,
+                    abs(v.dot(up)) / tan_v - depth,
+                )
+
+    cam.location = centre + offset * distance
 
     direction = centre - mathutils.Vector(cam.location)
     cam.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
@@ -350,7 +388,10 @@ def build_ground(bpy, subject) -> object:
     mins, maxs = world_bounds(bpy, [subject])
     extent = max(max(maxs[i] - mins[i] for i in range(3)), 1e-3)
 
-    bpy.ops.mesh.primitive_plane_add(size=extent * 14.0, location=(0, 0, 0))
+    # A hair below zero. The subject rests exactly on z=0, and a mesh with a
+    # flat underside - which is most of what the hosted 3D models return -
+    # would otherwise be coplanar with the plane and z-fight across its base.
+    bpy.ops.mesh.primitive_plane_add(size=extent * 14.0, location=(0, 0, -extent * 1e-3))
     ground = bpy.context.active_object
     ground.name = "GenFX_Ground"
 
@@ -435,12 +476,25 @@ def render_preview(bpy, output_path: str, samples: int) -> bool:
         scene.render.filepath = prev_path
 
 
-def export_glb(bpy, path: str) -> bool:
+def export_glb(bpy, path: str, subject=None) -> bool:
+    """
+    Export the subject alone for the web turntable.
+
+    Exporting the whole scene would drag the ground plane in with it, and that
+    plane is fourteen times the subject's extent - a viewer that auto-frames
+    the model then shows a huge floor with a speck in the middle. The .blend
+    keeps the full set dressing; the preview only needs the asset.
+    """
     try:
+        if subject is not None:
+            for obj in bpy.data.objects:
+                obj.select_set(obj is subject)
+            bpy.context.view_layer.objects.active = subject
+
         bpy.ops.export_scene.gltf(
             filepath=path,
             export_format="GLB",
-            use_selection=False,
+            use_selection=subject is not None,
             export_apply=True,
         )
         return os.path.exists(path)
@@ -453,6 +507,17 @@ def export_glb(bpy, path: str) -> bool:
 
 def main() -> int:
     args = parse_args()
+
+    # Blender resolves a relative path against the .blend file's own directory,
+    # not the working directory - so a relative --output lands somewhere else
+    # entirely, the texture next to the OBJ is never found, and pack_all has
+    # nothing to pack. Absolute paths from here on, whatever the caller passed.
+    args.mesh = os.path.abspath(args.mesh)
+    args.output = os.path.abspath(args.output)
+    for name in ("scene_json", "image", "preview", "glb_out"):
+        value = getattr(args, name, None)
+        if value:
+            setattr(args, name, os.path.abspath(value))
 
     mesh_path = Path(args.mesh)
     if not mesh_path.exists():
@@ -518,8 +583,9 @@ def main() -> int:
         "materials": [m.name for m in subject.data.materials if m],
     }
 
+    # Both of these run after the save, so neither can corrupt the deliverable.
     if args.glb_out:
-        stats["glb"] = args.glb_out if export_glb(bpy, args.glb_out) else None
+        stats["glb"] = args.glb_out if export_glb(bpy, args.glb_out, subject) else None
     if args.preview:
         stats["preview"] = args.preview if render_preview(bpy, args.preview, args.preview_samples) else None
 

@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 MESH_EXTENSIONS = (".glb", ".gltf", ".obj", ".ply", ".fbx", ".stl")
 
+# How far, in grid cells, the rim's UVs are pulled inside the silhouette.
+RIM_UV_INSET = 3
+
 
 @dataclass
 class MeshResult:
@@ -269,25 +272,48 @@ def _estimate_depth_hf(image_path: str) -> np.ndarray | None:
         return None
 
 
-def foreground_mask(arr: np.ndarray) -> np.ndarray:
+def background_model(arr: np.ndarray, band: int = 8) -> np.ndarray:
     """
-    Separate subject from background using the border colour as the reference.
-    Works well because stage 2 asks for a plain background on purpose.
+    Estimate the backdrop colour at *every* pixel, not just one colour overall.
+
+    A single median works for a flat background and fails for the studio
+    gradients text-to-image models actually produce - dark above, warm below.
+    Against one colour, half the backdrop reads as subject and the mesh comes
+    out a slab. Interpolating the four border strips tracks a smooth gradient
+    in either direction, and costs one pass over the image.
     """
     h, w, _ = arr.shape
-    border = np.concatenate(
-        [arr[:8].reshape(-1, 3), arr[-8:].reshape(-1, 3),
-         arr[:, :8].reshape(-1, 3), arr[:, -8:].reshape(-1, 3)]
-    )
-    bg = np.median(border, axis=0)
-    dist = np.linalg.norm(arr.astype(np.float32) - bg, axis=2)
+    band = max(1, min(band, h // 4, w // 4))
+    f = arr.astype(np.float32)
+
+    left = np.median(f[:, :band], axis=1)      # (h, 3) - backdrop down the left
+    right = np.median(f[:, -band:], axis=1)    # (h, 3)
+    top = np.median(f[:band, :], axis=0)       # (w, 3) - backdrop across the top
+    bottom = np.median(f[-band:, :], axis=0)   # (w, 3)
+
+    u = np.linspace(0.0, 1.0, w, dtype=np.float32)[None, :, None]
+    v = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None, None]
+
+    horizontal = left[:, None, :] * (1.0 - u) + right[:, None, :] * u
+    vertical = top[None, :, :] * (1.0 - v) + bottom[None, :, :] * v
+    return 0.5 * (horizontal + vertical)
+
+
+def foreground_mask(arr: np.ndarray) -> np.ndarray:
+    """
+    Separate subject from background using the borders as the reference.
+    Works well because stage 2 asks for a single centred subject on purpose.
+    """
+    h, w, _ = arr.shape
+    dist = np.linalg.norm(arr.astype(np.float32) - background_model(arr), axis=2)
 
     spread = float(np.percentile(dist, 98))
     threshold = max(18.0, spread * 0.22)
     mask = dist > threshold
 
-    # Keep only the component touching the centre; drop specks.
-    mask = _largest_component(mask)
+    # Keep the blob the subject is in; drop specks and any backdrop that slipped
+    # through. Stage 2 asks for one centred subject, so the centre is the seed.
+    mask = _subject_component(mask)
     mask = _binary_close(mask, 2)
 
     if mask.mean() < 0.02:  # segmentation failed - treat the frame as the subject
@@ -295,8 +321,15 @@ def foreground_mask(arr: np.ndarray) -> np.ndarray:
     return mask
 
 
-def _largest_component(mask: np.ndarray) -> np.ndarray:
-    """Flood-fill the biggest connected blob without needing scipy."""
+def _subject_component(mask: np.ndarray) -> np.ndarray:
+    """
+    Flood-fill without scipy and keep one blob: the one covering the centre if
+    there is one, else the largest.
+
+    Preferring the centre matters when part of the backdrop survives
+    thresholding - it is often larger than the subject, and picking by size
+    alone hands back the wall instead of the object standing in front of it.
+    """
     h, w = mask.shape
     labels = np.zeros((h, w), dtype=np.int32)
     current = 0
@@ -322,7 +355,21 @@ def _largest_component(mask: np.ndarray) -> np.ndarray:
             if size > best_size:
                 best_size, best_label = size, current
 
-    return labels == best_label if best_label else mask
+    if not best_label:
+        return mask
+
+    # A subject that is centred but smaller than a surviving patch of backdrop
+    # should still win. Look in a small window around the middle of the frame.
+    centre = labels[
+        max(0, h // 2 - h // 12): h // 2 + h // 12 + 1,
+        max(0, w // 2 - w // 12): w // 2 + w // 12 + 1,
+    ]
+    seeds = centre[centre > 0]
+    if seeds.size:
+        values, counts = np.unique(seeds, return_counts=True)
+        return labels == int(values[counts.argmax()])
+
+    return labels == best_label
 
 
 def _binary_close(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
@@ -385,6 +432,27 @@ def distance_transform(mask: np.ndarray) -> np.ndarray:
     return dist
 
 
+def _break_diagonal_pinches(cell: np.ndarray, max_passes: int = 12) -> np.ndarray:
+    """
+    Drop cells that meet a neighbour only at a corner.
+
+    Two quads touching diagonally share a single grid point and no edge. The rim
+    then runs through that point twice, which makes it a non-manifold vertex:
+    Blender still imports it, but solidify, boolean, remesh and 3D printing all
+    misbehave there. Clearing one of each diagonal pair keeps the surface a
+    clean 2-manifold, at the cost of one grid cell.
+    """
+    cell = cell.copy()
+    for _ in range(max_passes):
+        backslash = cell[:-1, :-1] & cell[1:, 1:] & ~cell[:-1, 1:] & ~cell[1:, :-1]
+        slash = cell[:-1, 1:] & cell[1:, :-1] & ~cell[:-1, :-1] & ~cell[1:, 1:]
+        if not (backslash.any() or slash.any()):
+            break
+        cell[1:, 1:] &= ~backslash
+        cell[1:, :-1] &= ~slash
+    return cell
+
+
 def build_solid_from_image(
     image_path: str,
     out_dir: Path,
@@ -398,6 +466,11 @@ def build_solid_from_image(
     Front surface = inflation dome (optionally modulated by a real depth map),
     back surface = shallower mirror, joined by a rim along the silhouette.
     Writes OBJ + MTL + texture PNG and returns (obj_path, verts, faces).
+
+    The result is watertight and consistently wound outward, which is what lets
+    Blender smooth-shade and light it correctly, and what lets a glTF viewer
+    show it with backface culling on. Both properties are asserted in the tests
+    (every edge used by exactly two faces; positive signed volume).
     """
     grid = grid or config.RELIEF_GRID
     depth_scale = depth_scale if depth_scale is not None else config.RELIEF_DEPTH_SCALE
@@ -426,17 +499,31 @@ def build_solid_from_image(
 
     height = height * mask
 
+    # A quad exists only where all four of its grid corners are inside the
+    # silhouette. Deriving the surface from cells rather than points is what
+    # keeps stray mask pixels from becoming loose vertices in the .blend.
+    cell = mask[:-1, :-1] & mask[:-1, 1:] & mask[1:, 1:] & mask[1:, :-1]
+    cell = _break_diagonal_pinches(cell)
+    if cell.sum() < 1:
+        raise RuntimeError("silhouette too small to build a mesh")
+
+    used = np.zeros_like(mask)
+    used[:-1, :-1] |= cell
+    used[:-1, 1:] |= cell
+    used[1:, 1:] |= cell
+    used[1:, :-1] |= cell
+
     back_scale = 0.55
     idx_front = -np.ones((grid, grid), dtype=np.int64)
-    idx_back = -np.ones((grid, grid), dtype=np.int64)
 
     verts: list[tuple[float, float, float]] = []
     uvs: list[tuple[float, float]] = []
+    cell_of: list[tuple[int, int]] = []   # front vertex index -> (y, x)
 
     span = 2.0
     for y in range(grid):
         for x in range(grid):
-            if not mask[y, x]:
+            if not used[y, x]:
                 continue
             px = (x / (grid - 1) - 0.5) * span
             # +Z is up in Blender; the image plane maps to X (right) and Z (up).
@@ -445,36 +532,77 @@ def build_solid_from_image(
             v = 1.0 - y / (grid - 1)
             d = float(height[y, x]) * depth_scale
 
+            # Front and back are written as a pair, so back == front + 1.
             idx_front[y, x] = len(verts)
+            cell_of.append((y, x))
             verts.append((px, -d, pz))
             uvs.append((u, v))
-
-            idx_back[y, x] = len(verts)
             verts.append((px, d * back_scale, pz))
             uvs.append((u, v))
 
-    faces: list[tuple[int, int, int, int]] = []
-    for y in range(grid - 1):
-        for x in range(grid - 1):
-            a, b = idx_front[y, x], idx_front[y, x + 1]
-            c, d = idx_front[y + 1, x + 1], idx_front[y + 1, x]
-            if a >= 0 and b >= 0 and c >= 0 and d >= 0:
-                faces.append((a, b, c, d))
-                ab, bb = idx_back[y, x], idx_back[y, x + 1]
-                cb, db = idx_back[y + 1, x + 1], idx_back[y + 1, x]
-                faces.append((db, cb, bb, ab))  # reversed winding
+    def back_of(front_index: int) -> int:
+        return front_index + 1
 
-    # Rim: stitch front to back wherever the silhouette has an outside edge.
-    for y in range(grid - 1):
-        for x in range(grid - 1):
-            if idx_front[y, x] < 0:
-                continue
-            if idx_front[y, x + 1] < 0 and idx_front[y + 1, x] >= 0 and idx_front[y + 1, x + 1] < 0:
-                faces.append((idx_front[y, x], idx_back[y, x],
-                              idx_back[y + 1, x], idx_front[y + 1, x]))
-            if idx_front[y + 1, x] < 0 and idx_front[y, x + 1] >= 0 and idx_front[y + 1, x + 1] < 0:
-                faces.append((idx_front[y, x + 1], idx_front[y, x],
-                              idx_back[y, x], idx_back[y, x + 1]))
+    def grid_of(front_index: int) -> tuple[int, int]:
+        return cell_of[front_index // 2]
+
+    # Front quads face -Y (toward the camera); back quads are the same loop
+    # reversed, so they face +Y. Getting this order wrong turns the mesh
+    # inside out: it still renders, but every normal points into the solid.
+    faces: list[tuple[int, ...]] = []
+    face_uvs: list[tuple[int, ...]] = []
+    front_edges: set[tuple[int, int]] = set()
+
+    def add_face(indices: tuple[int, ...], uv_indices: tuple[int, ...] | None = None) -> None:
+        faces.append(indices)
+        face_uvs.append(uv_indices if uv_indices is not None else indices)
+
+    for y, x in zip(*np.nonzero(cell)):
+        a = int(idx_front[y, x])
+        b = int(idx_front[y + 1, x])
+        c = int(idx_front[y + 1, x + 1])
+        d = int(idx_front[y, x + 1])
+        add_face((a, b, c, d))
+        add_face((back_of(d), back_of(c), back_of(b), back_of(a)))
+        quad = (a, b, c, d)
+        for i in range(4):
+            front_edges.add((quad[i], quad[(i + 1) % 4]))
+
+    # Rim: exactly the front edges with no opposing twin, stitched to the back.
+    # Traversing each in reverse is what makes every edge in the finished mesh
+    # used once in each direction - the definition of a closed, oriented surface.
+    #
+    # The rim gets its own UVs, pulled a few pixels into the silhouette. Sampled
+    # where they sit, they would land on the plain background the subject was
+    # generated against, and every one of these meshes would wear a white edge.
+    rim_uv_index: dict[int, int] = {}
+
+    def rim_uv_for(front_index: int) -> int:
+        cached = rim_uv_index.get(front_index)
+        if cached is not None:
+            return cached
+        y, x = grid_of(front_index)
+        for _ in range(RIM_UV_INSET):
+            best = (dist[y, x], y, x)
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < grid and 0 <= nx < grid and dist[ny, nx] > best[0]:
+                        best = (dist[ny, nx], ny, nx)
+            if (best[1], best[2]) == (y, x):
+                break
+            y, x = best[1], best[2]
+        uvs.append((x / (grid - 1), 1.0 - y / (grid - 1)))
+        rim_uv_index[front_index] = len(uvs) - 1
+        return rim_uv_index[front_index]
+
+    for u_idx, v_idx in front_edges:
+        if (v_idx, u_idx) in front_edges:
+            continue
+        add_face(
+            (v_idx, u_idx, back_of(u_idx), back_of(v_idx)),
+            (rim_uv_for(v_idx), rim_uv_for(u_idx), rim_uv_for(u_idx), rim_uv_for(v_idx)),
+        )
 
     if len(verts) < 8 or len(faces) < 4:
         raise RuntimeError("silhouette too small to build a mesh")
@@ -507,8 +635,10 @@ def build_solid_from_image(
             fh.write(f"vt {u:.5f} {v:.5f}\n")
         fh.write("usemtl GenFXMaterial\n")
         fh.write("s 1\n")
-        for face in faces:
-            fh.write("f " + " ".join(f"{i + 1}/{i + 1}" for i in face) + "\n")
+        for face, face_uv in zip(faces, face_uvs):
+            fh.write(
+                "f " + " ".join(f"{v + 1}/{t + 1}" for v, t in zip(face, face_uv)) + "\n"
+            )
 
     return obj_path, len(verts), len(faces)
 
@@ -545,7 +675,11 @@ def generate_mesh(image_path: str, out_dir: str | Path) -> MeshResult:
 
             if tier == "depth":
                 img = Image.open(image_path).convert("RGB")
-                depth = _estimate_depth_local(img) or _estimate_depth_hf(image_path)
+                # `a or b` would ask numpy for the truth value of a whole depth
+                # array, which raises - and would silently defeat this tier.
+                depth = _estimate_depth_local(img)
+                if depth is None:
+                    depth = _estimate_depth_hf(image_path)
                 if depth is None:
                     raise RuntimeError("no depth backend available")
                 t0 = time.time()

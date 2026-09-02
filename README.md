@@ -99,12 +99,43 @@ background — which is also why the system prompt asks for exactly that.
    inflated with a distance transform into a closed, textured solid. Pure
    NumPy, no model, no key, no network. This one always works.
 
+Segmentation models the backdrop as a gradient rather than a single colour,
+because that is what image models actually produce — a studio falloff from dark
+to warm. Against one colour most of the backdrop reads as subject and the mesh
+comes out as a slab with the object buried in it. The four border strips are
+interpolated into a per-pixel estimate instead, and the blob covering the centre
+of the frame wins over the largest blob: whatever backdrop survives thresholding
+is often bigger than the subject standing in front of it.
+
+Whichever tier produced it, the local solid is built to three invariants the
+tests assert on every run, because each is invisible until it ruins something
+downstream:
+
+| Invariant | What breaks without it |
+|---|---|
+| Every edge borders exactly two faces | Holes; solidify, boolean and 3D printing all fail |
+| Every directed edge used once | Inconsistent orientation, patchy shading |
+| Positive signed volume | The solid is inside out — the light rig lands on the back of every face |
+
+The rim also samples its texture a few pixels *inside* the silhouette. Sampled
+where it sits, it would pick up the plain background the subject was generated
+against, and every mesh would wear a white edge.
+
 ### 4 · Mesh → `.blend`
 
 Blender binary → pip `bpy` module → remote worker Space.
 
 The build always runs in a subprocess: Blender's Python can abort a process
-outright, and that must not take the web app with it.
+outright, and that must not take the web app with it. Each runtime writes its
+own `blender-<runtime>.log` in the run directory, so a failed first attempt
+still has its evidence after the second one runs.
+
+Every path handed to Blender is made absolute first. Blender resolves a
+relative path against the `.blend` it is writing rather than the working
+directory, so a relative runs directory produced a file with no texture,
+nothing packed and the preview saved somewhere else entirely — at exit code
+zero, with no warning. CI now builds from a relative directory on purpose and
+reopens the result to check.
 
 ---
 
@@ -185,7 +216,7 @@ ui/
 worker/
   app.py            Optional Gradio worker for split deployments
 deploy/             Space cards, worker Dockerfile, deploy script
-tests/              68 tests, no keys, no network, no Blender required
+tests/              79 tests, no keys, no network, no Blender required
 ```
 
 ---
@@ -193,13 +224,18 @@ tests/              68 tests, no keys, no network, no Blender required
 ## Tests
 
 ```bash
-pytest -q          # 68 passed
+pytest -q          # 79 passed
 ```
 
 Offline by design: no API keys, no network, no Blender. The tests that need a
 Blender runtime skip themselves when there isn't one — and when there is, they
 reopen the generated `.blend` and assert the mesh, the material, the three
 lights, the camera and the packed textures all survived the round trip.
+
+The mesh tests check the geometry itself rather than just that a file appeared:
+watertightness, winding consistency, outward normals, no loose vertices. A mesh
+can be none of those things and still open in Blender looking roughly right,
+which is exactly why they are asserted rather than eyeballed.
 
 ---
 

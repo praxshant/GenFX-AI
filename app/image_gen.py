@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageFilter
+from PIL import Image
 
 from app import config
 
@@ -151,29 +151,42 @@ def get_provider(name: str):
 
 # ── Post-processing for 3D reconstruction ─────────────────────────────────────
 
+def _border_colour(img: Image.Image) -> tuple[int, int, int]:
+    """Median colour of the image's outer frame - the background, in practice."""
+    w, h = img.size
+    band = max(1, min(w, h) // 64)
+    # tobytes() rather than getdata(): same pixels, no per-pixel Python objects,
+    # and it does not ride Pillow's getdata deprecation.
+    raw = bytearray()
+    for box in (
+        (0, 0, w, band), (0, h - band, w, h),
+        (0, 0, band, h), (w - band, 0, w, h),
+    ):
+        raw += img.crop(box).convert("RGB").tobytes()
+    if not raw:
+        return (240, 240, 240)
+    return tuple(sorted(raw[channel::3])[len(raw) // 6] for channel in range(3))
+
+
 def prepare_for_reconstruction(img: Image.Image, size: int = 1024) -> Image.Image:
     """
-    Square-pad the image on a background sampled from its own corners, so the
+    Square-pad the image on a background sampled from its own border, so the
     subject stays centred and uncropped. Image-to-3D models expect this.
+
+    The padding colour is a median rather than a corner average: one dark corner
+    would otherwise drag the whole background toward it and leave a visible
+    frame that segmentation then reads as part of the subject. Nothing is
+    blurred - detail in the subject is the one thing reconstruction cannot
+    recover later.
     """
     img = img.convert("RGB")
     w, h = img.size
     if w == h:
         return img.resize((size, size), Image.LANCZOS)
 
-    corners = [
-        img.getpixel((0, 0)),
-        img.getpixel((w - 1, 0)),
-        img.getpixel((0, h - 1)),
-        img.getpixel((w - 1, h - 1)),
-    ]
-    bg = tuple(sum(c[i] for c in corners) // 4 for i in range(3))
-
     side = max(w, h)
-    canvas = Image.new("RGB", (side, side), bg)
+    canvas = Image.new("RGB", (side, side), _border_colour(img))
     canvas.paste(img, ((side - w) // 2, (side - h) // 2))
-    # Soften the seam between padding and image edge.
-    canvas = canvas.filter(ImageFilter.SMOOTH)
     return canvas.resize((size, size), Image.LANCZOS)
 
 

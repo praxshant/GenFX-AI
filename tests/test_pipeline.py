@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -42,6 +43,7 @@ from app.llm_parser import (  # noqa: E402
 )
 from app.mesh_gen import (  # noqa: E402
     MeshResult,
+    _break_diagonal_pinches,
     _harvest_mesh_file,
     build_solid_from_image,
     distance_transform,
@@ -352,6 +354,37 @@ class TestSegmentation:
         assert mask[130, 128]        # centre of the blob
         assert not mask[4, 4]        # corner is background
 
+    def test_survives_a_gradient_backdrop(self):
+        """
+        Text-to-image models produce studio gradients, not flat colour. Measured
+        against a single median colour, half the backdrop reads as subject and
+        the mesh comes out a slab.
+        """
+        h = w = 160
+        arr = np.zeros((h, w, 3), dtype=np.uint8)
+        for y in range(h):  # dark above, warm below
+            shade = 40 + int(150 * y / h)
+            arr[y, :] = (shade, int(shade * 0.95), int(shade * 0.85))
+        for y in range(h):
+            for x in range(w):
+                if ((x - 80) / 26) ** 2 + ((y - 84) / 34) ** 2 <= 1.0:
+                    arr[y, x] = (20, 90, 200)
+
+        mask = foreground_mask(arr)
+        assert 0.02 < mask.mean() < 0.20, f"backdrop leaked in: {mask.mean():.1%}"
+        assert mask[84, 80], "subject centre was not selected"
+        assert not mask[6, 6] and not mask[h - 6, w - 6], "backdrop corners selected"
+
+    def test_a_centred_subject_beats_a_larger_backdrop_patch(self):
+        """Picking the biggest blob hands back the wall, not the object."""
+        arr = np.full((120, 120, 3), 235, dtype=np.uint8)
+        arr[:40, :] = (30, 30, 30)                 # a big dark band along the top
+        arr[50:80, 45:75] = (200, 40, 40)          # the smaller, centred subject
+
+        mask = foreground_mask(arr)
+        assert mask[64, 60], "centred subject not selected"
+        assert not mask[10, 60], "the larger backdrop band won instead"
+
     def test_uniform_image_degrades_to_full_frame(self):
         arr = np.full((64, 64, 3), 128, dtype=np.uint8)
         assert foreground_mask(arr).mean() == 1.0
@@ -387,6 +420,98 @@ class TestSolidConstruction:
             if line.startswith("v ")
         ]
         assert min(ys) < 0 < max(ys), "mesh should have depth on both sides"
+
+
+def _read_obj(path: Path) -> tuple[list[tuple[float, float, float]], list[list[int]]]:
+    verts: list[tuple[float, float, float]] = []
+    faces: list[list[int]] = []
+    for line in path.read_text().splitlines():
+        if line.startswith("v "):
+            verts.append(tuple(float(t) for t in line.split()[1:4]))
+        elif line.startswith("f "):
+            faces.append([int(tok.split("/")[0]) - 1 for tok in line.split()[1:]])
+    return verts, faces
+
+
+@pytest.fixture(scope="module")
+def obj(tmp_path_factory) -> Path:
+    """One solid, built once, inspected from several angles below."""
+    tmp = tmp_path_factory.mktemp("solid")
+    img = Image.new("RGB", (192, 192), (238, 238, 240))
+    pixels = img.load()
+    for y in range(192):
+        for x in range(192):
+            if ((x - 96) / 48) ** 2 + ((y - 98) / 62) ** 2 <= 1.0:
+                pixels[x, y] = (150, 80, 40)
+    src = tmp / "subject.png"
+    img.save(src)
+    path, _, _ = build_solid_from_image(str(src), tmp / "mesh", grid=56)
+    return path
+
+
+class TestSolidIsAProperSolid:
+    """
+    The three properties that decide whether the .blend is usable rather than
+    merely openable. All three were broken once; none is cheap to spot by eye.
+    """
+
+    def test_watertight(self, obj):
+        """Every edge borders exactly two faces - no holes for Blender to find."""
+        _, faces = _read_obj(obj)
+        edges = Counter()
+        for face in faces:
+            for i in range(len(face)):
+                a, b = face[i], face[(i + 1) % len(face)]
+                edges[(min(a, b), max(a, b))] += 1
+        assert [e for e, n in edges.items() if n == 1] == [], "open boundary edges"
+        assert [e for e, n in edges.items() if n > 2] == [], "non-manifold edges"
+
+    def test_consistently_wound(self, obj):
+        """Each directed edge used once, which is what makes the surface oriented."""
+        _, faces = _read_obj(obj)
+        directed = Counter()
+        for face in faces:
+            for i in range(len(face)):
+                directed[(face[i], face[(i + 1) % len(face)])] += 1
+        assert max(directed.values()) == 1
+
+    def test_normals_point_outward(self, obj):
+        """
+        Positive signed volume. Negative means the solid is inside out: it still
+        renders, but the light rig lands on the back of every face.
+        """
+        verts, faces = _read_obj(obj)
+        volume = 0.0
+        for face in faces:
+            for k in range(1, len(face) - 1):
+                a, b, c = verts[face[0]], verts[face[k]], verts[face[k + 1]]
+                volume += (
+                    a[0] * (b[1] * c[2] - b[2] * c[1])
+                    - a[1] * (b[0] * c[2] - b[2] * c[0])
+                    + a[2] * (b[0] * c[1] - b[1] * c[0])
+                ) / 6.0
+        assert volume > 0, "mesh is inside out"
+
+    def test_no_loose_vertices(self, obj):
+        verts, faces = _read_obj(obj)
+        assert {i for face in faces for i in face} == set(range(len(verts)))
+
+    def test_rim_uvs_are_pulled_inside_the_silhouette(self, obj):
+        """
+        The rim samples the texture a few pixels in. Left on the silhouette it
+        would sample the plain background and every mesh would wear a white edge.
+        """
+        text = obj.read_text()
+        uv_count = text.count("\nvt ")
+        vert_count = text.count("\nv ")
+        assert uv_count > vert_count, "no extra rim UVs were emitted"
+
+    def test_diagonal_pinches_are_removed(self):
+        """Two cells meeting only at a corner would make that point non-manifold."""
+        cell = np.zeros((6, 6), dtype=bool)
+        cell[1, 1] = cell[2, 2] = True
+        cleaned = _break_diagonal_pinches(cell)
+        assert cleaned.sum() < 2
 
 
 class TestMeshHarvesting:
@@ -426,6 +551,21 @@ class TestMeshCascade:
         assert result.textured is True
         assert Path(result.mesh_path).exists()
         assert any("space" in a for a in result.attempts)
+
+    def test_depth_tier_accepts_a_real_depth_array(self, subject_image, tmp_path):
+        """
+        `local() or hf()` asked numpy for the truth value of a whole depth map,
+        which raises - so this tier could only ever fail, and did so silently.
+        """
+        depth = np.linspace(0, 1, 64 * 64, dtype=np.float32).reshape(64, 64)
+        with patch.object(config, "MESH_PROVIDER_ORDER", ["depth"]), \
+             patch("app.mesh_gen._estimate_depth_local", return_value=depth), \
+             patch.object(config, "RELIEF_GRID", 48):
+            result = generate_mesh(str(subject_image), tmp_path / "mesh")
+
+        assert result.method == "depth", result.attempts
+        assert result.status == "ok"
+        assert Path(result.mesh_path).exists()
 
     def test_space_success_short_circuits(self, subject_image, tmp_path):
         fake = tmp_path / "fake.glb"
@@ -501,6 +641,43 @@ class TestBlendBuilder:
         runtime = describe_runtime()
         assert {"blender_binary", "bpy_module", "worker"} <= set(runtime)
 
+    def test_paths_handed_to_blender_are_absolute(self, tmp_path, monkeypatch):
+        """
+        Blender resolves a relative path against the .blend it is writing, not
+        the working directory. Passing relative paths through produced a file
+        with no texture, nothing packed, and the preview saved off in the void -
+        all without a single error.
+        """
+        mesh = tmp_path / "m.obj"
+        mesh.write_text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+        Image.new("RGB", (8, 8)).save(tmp_path / "ref.png")
+
+        seen: list[list[str]] = []
+
+        def fake_run(cmd, log_path):
+            seen.append(cmd)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("", encoding="utf-8")
+            return 1, ""
+
+        monkeypatch.chdir(tmp_path)
+        with patch("app.blend_builder.resolve_blender_path", return_value=None), \
+             patch("app.blend_builder._run", fake_run), \
+             patch.object(config, "BLEND_WORKER_URL", ""):
+            build_blend(
+                "m.obj", "out",
+                scene_json=normalise_scene({}, "x"),
+                image_path="ref.png",
+                make_preview=True,
+            )
+
+        assert seen, "no runtime was attempted"
+        cmd = seen[0]
+        for flag in ("--mesh", "--output", "--image", "--preview", "--glb-out", "--scene-json"):
+            assert flag in cmd, f"{flag} was not passed"
+            value = cmd[cmd.index(flag) + 1]
+            assert Path(value).is_absolute(), f"{flag} was relative: {value}"
+
     def test_no_runtime_degrades_gracefully(self, tmp_path):
         mesh = tmp_path / "m.obj"
         mesh.write_text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
@@ -544,6 +721,55 @@ class TestBlendBuilderIntegration:
             or head[:2] == b"\x1f\x8b"           # gzip
         ), f"unexpected .blend header: {head!r}"
         assert result.stats.get("polygons", 0) > 0
+
+    def test_the_camera_frames_the_whole_subject(self, subject_image, tmp_path):
+        """
+        Every bounding-box corner inside the frame, and the subject filling a
+        real share of it. Fitting the bounding sphere instead of the box framed
+        the box's diagonal, and left the asset at half the height of its own
+        preview.
+        """
+        obj, _, _ = build_solid_from_image(str(subject_image), tmp_path / "mesh", grid=48)
+        result = build_blend(
+            obj, tmp_path / "out",
+            scene_json=normalise_scene({}, "test"),
+            make_preview=False,
+        )
+        assert result.status == "ok", result.error_message
+
+        probe = tmp_path / "framing.py"
+        probe.write_text(
+            "import bpy, json, sys\n"
+            "from mathutils import Vector\n"
+            "from bpy_extras.object_utils import world_to_camera_view\n"
+            f"bpy.ops.wm.open_mainfile(filepath={str(result.blend_path)!r})\n"
+            "scene = bpy.context.scene\n"
+            "cam = scene.camera.evaluated_get(bpy.context.evaluated_depsgraph_get())\n"
+            "subj = bpy.data.objects['GenFX_Subject']\n"
+            "xs, ys = [], []\n"
+            "for corner in subj.bound_box:\n"
+            "    co = world_to_camera_view(scene, cam, subj.matrix_world @ Vector(corner))\n"
+            "    xs.append(co.x); ys.append(co.y)\n"
+            "print('PROBE ' + json.dumps({'min_x': min(xs), 'max_x': max(xs),\n"
+            "    'min_y': min(ys), 'max_y': max(ys)}))\n"
+        )
+
+        import subprocess
+
+        blender = resolve_blender_path()
+        cmd = (
+            [blender, "--background", "--factory-startup", "--python", str(probe)]
+            if blender else [sys.executable, str(probe)]
+        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("PROBE ")), None)
+        assert line, f"probe produced no result:\n{proc.stdout[-800:]}\n{proc.stderr[-800:]}"
+
+        box = json.loads(line[len("PROBE "):])
+        assert box["min_x"] >= 0.0 and box["max_x"] <= 1.0, f"clipped horizontally: {box}"
+        assert box["min_y"] >= 0.0 and box["max_y"] <= 1.0, f"clipped vertically: {box}"
+        filled = max(box["max_x"] - box["min_x"], box["max_y"] - box["min_y"])
+        assert filled > 0.5, f"subject fills only {filled:.0%} of the frame"
 
     def test_the_saved_blend_reopens_with_the_expected_scene(self, subject_image, tmp_path):
         """The deliverable is a file an artist opens - so open it and check."""

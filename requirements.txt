@@ -1,5 +1,7 @@
 # ── Core app ──────────────────────────────────────────────────────────────────
-streamlit>=1.40.0
+# 1.49 is the floor, not a preference: the UI sizes buttons and images with
+# width="stretch", which older releases reject outright with a TypeError.
+streamlit>=1.49.0
 Pillow>=10.0.0
 numpy>=1.24,<3
 requests>=2.31.0

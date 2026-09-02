@@ -9,6 +9,7 @@ disk and a manifest explaining exactly which path each stage took.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import shutil
@@ -226,9 +227,11 @@ def load_run(run_id: str) -> RunResult | None:
         return None
     try:
         data = json.loads(manifest.read_text(encoding="utf-8"))
-        data.pop("duration", None)
-        data.pop("ok", None)
-        return RunResult(**data)
+        # Keep only the fields this version knows about. A manifest written by
+        # an older or newer build should still load the gallery rather than
+        # blowing up on one unexpected key.
+        fields = {f.name for f in dataclasses.fields(RunResult)}
+        return RunResult(**{k: v for k, v in data.items() if k in fields})
     except Exception as exc:
         logger.warning("Could not load run %s: %s", run_id, exc)
         return None

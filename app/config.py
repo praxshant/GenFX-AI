@@ -45,7 +45,10 @@ ASSETS_DIR = PROJECT_ROOT / "assets"
 BLENDER_DIR = PROJECT_ROOT / "blender"
 
 # Runs live outside the source tree when RUNS_DIR is set (Spaces uses /data).
-RUNS_DIR = Path(os.getenv("GENFX_RUNS_DIR", str(PROJECT_ROOT / "runs")))
+# Resolved: everything downstream hands these paths to Blender, which reads a
+# relative path as relative to the .blend it is writing rather than to the
+# working directory.
+RUNS_DIR = Path(os.getenv("GENFX_RUNS_DIR", str(PROJECT_ROOT / "runs"))).expanduser().resolve()
 
 FALLBACK_JSON_PATH = ASSETS_DIR / "fallback_scene.json"
 FALLBACK_IMAGE_PATH = ASSETS_DIR / "fallback_image.png"
@@ -155,7 +158,7 @@ IMAGE_TIMEOUT_SECONDS = _env_int("GENFX_IMAGE_TIMEOUT", 120)
 
 # ── Housekeeping ──────────────────────────────────────────────────────────────
 MAX_RUNS_KEPT = _env_int("GENFX_MAX_RUNS", 40)
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 
 def summary() -> dict[str, object]:

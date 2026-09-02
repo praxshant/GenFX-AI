@@ -8,12 +8,14 @@ between so you know what you are downloading before you open Blender.
 from __future__ import annotations
 
 import base64
+import html
 import json
 import logging
 import sys
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -161,6 +163,17 @@ inject_css(STYLES)
 
 # ── Small helpers ─────────────────────────────────────────────────────────────
 
+def esc(value: object) -> str:
+    """
+    Escape anything bound for the st.markdown(unsafe_allow_html=True) blocks.
+
+    Prompts, provider names and diagnostic text all reach those blocks, and a
+    prompt is free text - "a <script> prop" would otherwise be injected into
+    the page rather than shown on it.
+    """
+    return html.escape(str(value), quote=True)
+
+
 def badge(status: str) -> str:
     label = {"ok": "OK", "fallback": "FALLBACK", "running": "WORKING", "pending": "PENDING"}.get(
         status, status.upper()
@@ -173,14 +186,14 @@ def status_row(label: str, status: str, detail: str = "") -> str:
     dot_cls = {"ok": "dot-ok", "fallback": "dot-fb", "running": "dot-run"}.get(status, "dot-pend")
     val_cls = {"ok": "val-ok", "fallback": "val-fb", "running": "val-run"}.get(status, "val-pend")
     dot = "○" if status == "pending" else "●"
-    html = (
+    markup = (
         f'<div class="status-row"><span class="{dot_cls}">{dot}</span>'
-        f'<span class="lbl">{label}</span>'
+        f'<span class="lbl">{esc(label)}</span>'
         f'<span class="val {val_cls}">{status.upper()}</span></div>'
     )
     if detail:
-        html += f'<div class="side-detail">{detail}</div>'
-    return html
+        markup += f'<div class="side-detail">{esc(detail)}</div>'
+    return markup
 
 
 def flow_html(active: str | None = None) -> str:
@@ -228,7 +241,7 @@ def model_viewer(glb_path: str, height: int = 420) -> None:
         return
 
     b64 = base64.b64encode(data).decode("ascii")
-    st.components.v1.html(
+    components.html(
         f"""
         <script type="module"
           src="https://cdn.jsdelivr.net/npm/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
@@ -268,6 +281,7 @@ for key, default in (
     ("live_status", {s: "pending" for s in STAGE_LABELS}),
     ("prompt_input", ""),
     ("pending_prompt", ""),
+    ("fatal_error", None),
 ):
     if key not in st.session_state:
         st.session_state[key] = default
@@ -362,12 +376,26 @@ with cols[0]:
 with cols[1]:
     fast = st.toggle("Fast", value=False, help="Skip the rendered preview image. Saves ~5s.")
 
+def use_example(text: str) -> None:
+    """
+    Fill the prompt box from an example button.
+
+    This has to be an on_click callback. Assigning to a widget-keyed session
+    value inline would run *after* the text area was instantiated this pass,
+    which Streamlit rejects outright; callbacks run before the next pass builds
+    its widgets, so the assignment lands.
+    """
+    st.session_state.prompt_input = text
+
+
 with st.expander("Try an example"):
     ex_cols = st.columns(3)
     for i, example in enumerate(EXAMPLES):
-        if ex_cols[i % 3].button(example, key=f"ex_{i}", width="stretch"):
-            st.session_state.prompt_input = example
-            st.rerun()
+        ex_cols[i % 3].button(
+            example, key=f"ex_{i}", width="stretch",
+            on_click=use_example, args=(example,),
+            disabled=st.session_state.running,
+        )
 
 if go:
     if prompt.strip():
@@ -390,7 +418,7 @@ if st.session_state.running:
         progress.progress(min(1.0, done / len(order)))
         placeholder.markdown(
             f'<div class="card"><div class="card-num">Working</div>'
-            f'<div class="card-title">{STAGE_LABELS.get(stage, stage)} · {state}</div></div>',
+            f'<div class="card-title">{esc(STAGE_LABELS.get(stage, stage))} · {esc(state)}</div></div>',
             unsafe_allow_html=True,
         )
 
@@ -402,13 +430,19 @@ if st.session_state.running:
         )
         st.session_state.result = result
         st.session_state.live_status = result.status
+        st.session_state.fatal_error = None
     except Exception as exc:  # the pipeline swallows its own errors; this is belt-and-braces
-        st.error(f"Pipeline error: {exc}")
+        # Stash it: the rerun below discards anything drawn on this pass, so
+        # rendering the error here would flash it away before it can be read.
+        st.session_state.fatal_error = f"{type(exc).__name__} - {exc}"
     finally:
         st.session_state.running = False
         progress.empty()
         placeholder.empty()
         st.rerun()
+
+if st.session_state.fatal_error:
+    st.error(f"Pipeline error: {st.session_state.fatal_error}")
 
 # ── Results ───────────────────────────────────────────────────────────────────
 result = st.session_state.result
@@ -425,11 +459,11 @@ else:
     st.markdown(
         f'<div class="hero">'
         f'  <div class="hero-kicker">{result.run_id} · {result.duration:.1f}s</div>'
-        f'  <div class="hero-title">{result.prompt}</div>'
+        f'  <div class="hero-title">{esc(result.prompt)}</div>'
         f'  <div class="hero-meta">'
         f'    {stats.get("polygons", 0):,} polygons · {stats.get("vertices", 0):,} vertices'
-        f'    · Blender {stats.get("blender_version", "-")}'
-        f'    · mesh via {result.providers.get("mesh") or "n/a"}'
+        f'    · Blender {esc(stats.get("blender_version", "-"))}'
+        f'    · mesh via {esc(result.providers.get("mesh") or "n/a")}'
         f'  </div>'
         f'</div>',
         unsafe_allow_html=True,
@@ -445,11 +479,18 @@ else:
             type="primary",
             width="stretch",
         )
-        glb = read_file(result.glb_path) or read_file(result.mesh_path)
-        if glb:
+        # Name the file after what it actually is. Falling back to the raw mesh
+        # while still calling it .glb hands the artist an OBJ that no glTF
+        # viewer will open.
+        mesh_source = result.glb_path if read_file(result.glb_path) else result.mesh_path
+        mesh_data = read_file(mesh_source)
+        if mesh_data:
+            suffix = Path(mesh_source).suffix.lower() or ".glb"
+            mime = "model/gltf-binary" if suffix == ".glb" else "application/octet-stream"
             dl_cols[1].download_button(
-                "⬇  .glb", data=glb, file_name=f"genfx_{result.run_id}.glb",
-                mime="model/gltf-binary", width="stretch",
+                f"⬇  {suffix}", data=mesh_data,
+                file_name=f"genfx_{result.run_id}{suffix}",
+                mime=mime, width="stretch",
             )
         img = read_file(result.image_path)
         if img:
@@ -537,7 +578,7 @@ else:
                 continue
             st.markdown(f"**{STAGE_LABELS[stage]}** · `{result.providers.get(stage) or '-'}`")
             for line in attempts:
-                st.markdown(f'<div class="diag">{line}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="diag">{esc(line)}</div>', unsafe_allow_html=True)
             if diag:
-                st.markdown(f'<div class="diag">{diag}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="diag">{esc(diag)}</div>', unsafe_allow_html=True)
         st.caption(f"Run directory: {result.run_dir}")

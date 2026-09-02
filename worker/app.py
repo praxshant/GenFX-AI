@@ -16,6 +16,7 @@ import json
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import gradio as gr
@@ -27,13 +28,35 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.blend_builder import build_blend, describe_runtime  # noqa: E402
 from app.mesh_gen import build_solid_from_image  # noqa: E402
 
+WORK_ROOT = Path(tempfile.gettempdir()) / "genfx_worker"
+KEEP_SECONDS = 3600
+
+
+def new_workdir(prefix: str) -> Path:
+    """
+    A scratch directory for one build, after sweeping stale ones.
+
+    Gradio serves the .blend from wherever it was written, so the directory has
+    to outlive the call. Without this sweep a long-lived Space accumulates every
+    mesh it has ever built and eventually fills its disk.
+    """
+    WORK_ROOT.mkdir(parents=True, exist_ok=True)
+    cutoff = time.time() - KEEP_SECONDS
+    for stale in WORK_ROOT.iterdir():
+        try:
+            if stale.is_dir() and stale.stat().st_mtime < cutoff:
+                shutil.rmtree(stale, ignore_errors=True)
+        except OSError:
+            pass
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=WORK_ROOT))
+
 
 def build_from_mesh(mesh_file, scene_json: str) -> tuple[str | None, str]:
     """Turn an uploaded mesh into a downloadable .blend."""
     if not mesh_file:
         return None, "No mesh uploaded."
 
-    workdir = Path(tempfile.mkdtemp(prefix="genfx_worker_"))
+    workdir = new_workdir("mesh_")
     src = Path(mesh_file)
     local = workdir / src.name
     shutil.copy(src, local)
@@ -63,7 +86,7 @@ def build_from_image(image_path, scene_json: str) -> tuple[str | None, str]:
     if not image_path:
         return None, "No image uploaded."
 
-    workdir = Path(tempfile.mkdtemp(prefix="genfx_worker_img_"))
+    workdir = new_workdir("image_")
     try:
         obj, verts, faces = build_solid_from_image(str(image_path), workdir / "mesh")
     except Exception as exc:

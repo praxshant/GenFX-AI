@@ -22,7 +22,10 @@ RUN useradd -m -u 1000 genfx
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt gradio>=4.44.0
+# Quote the specifier: unquoted, the shell reads ">=4.44.0" as a redirection,
+# installs whatever gradio is latest and writes the build log into a file
+# called "=4.44.0".
+RUN pip install --no-cache-dir -r requirements.txt "gradio>=4.44.0"
 
 COPY --chown=genfx:genfx . .
 RUN python create_fallback_assets.py && chown -R genfx:genfx /app

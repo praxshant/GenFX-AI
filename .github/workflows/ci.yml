@@ -37,6 +37,10 @@ jobs:
       - name: Run tests
         run: pytest -q
 
+      # Deliberately run from a relative output directory. Blender resolves a
+      # relative path against the .blend it is writing, and that once produced a
+      # file with no texture, nothing packed and no preview - with a zero exit
+      # code and no warning anywhere. The assertions below are what catch it.
       - name: Verify a .blend can actually be built
         run: |
           python - <<'PY'
@@ -56,7 +60,27 @@ jobs:
           canvas.save(img)
 
           mesh, verts, faces = build_solid_from_image(str(img), out / "mesh", grid=64)
-          result = build_blend(mesh, out, image_path=str(img), make_preview=False)
+          result = build_blend(mesh, out, image_path=str(img), make_preview=True)
           assert result.status == "ok", result.error_message
+          assert result.preview_path and Path(result.preview_path).exists(), "no preview render"
+          assert result.glb_path and Path(result.glb_path).exists(), "no GLB export"
           print(f"OK  runtime={result.runtime}  {faces} faces  {result.blend_path}")
+          PY
+
+      - name: Verify the saved .blend carries its textures
+        run: |
+          python - <<'PY'
+          import bpy
+          bpy.ops.wm.open_mainfile(filepath=str(__import__("pathlib").Path("ci-out/scene.blend").resolve()))
+
+          subject = next((o for o in bpy.data.objects if o.name == "GenFX_Subject"), None)
+          assert subject, "GenFX_Subject missing"
+          assert len(subject.data.polygons) > 0, "subject has no geometry"
+          assert len([o for o in bpy.data.objects if o.type == "LIGHT"]) >= 3, "light rig missing"
+          assert bpy.context.scene.camera, "no scene camera"
+
+          unpacked = [i.name for i in bpy.data.images if not i.packed_file]
+          assert not unpacked, f"textures not packed into the .blend: {unpacked}"
+          print(f"OK  {len(subject.data.polygons)} polygons, "
+                f"{len(bpy.data.images)} packed image(s)")
           PY

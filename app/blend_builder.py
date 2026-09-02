@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 from app import config
@@ -72,8 +73,15 @@ def resolve_blender_path(configured_path: str | None = None) -> str | None:
     return None
 
 
+@lru_cache(maxsize=1)
 def has_bpy_module() -> bool:
-    """True when `import bpy` works in a fresh subprocess of this interpreter."""
+    """
+    True when `import bpy` works in a fresh subprocess of this interpreter.
+
+    Cached: importing bpy costs seconds and hundreds of megabytes, and the
+    health panel asks this on every page load. The answer cannot change while
+    the process is alive.
+    """
     try:
         proc = subprocess.run(
             [sys.executable, "-c", "import bpy; print(bpy.app.version_string)"],
@@ -189,9 +197,14 @@ def build_blend(
     Build the .blend. Never raises; returns status "fallback" with a diagnostic
     when no runtime could produce a file.
     """
-    mesh_path = Path(mesh_path)
-    out_dir = Path(out_dir)
+    # Absolute from the start: Blender treats a relative path as relative to
+    # the .blend it is writing, so a relative runs directory silently produces
+    # an untextured file and a preview saved somewhere nobody looks.
+    mesh_path = Path(mesh_path).resolve()
+    out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    if image_path:
+        image_path = str(Path(image_path).resolve())
 
     if not mesh_path.exists():
         return BlendResult(
@@ -200,7 +213,6 @@ def build_blend(
         )
 
     output_path = out_dir / "scene.blend"
-    log_path = out_dir / "blender.log"
     scene_json_path = None
     if scene_json is not None:
         scene_json_path = out_dir / "scene.json"
@@ -216,46 +228,55 @@ def build_blend(
     )
 
     errors: list[str] = []
+    logs: list[Path] = []
+
+    def attempt(runtime: str, cmd: list[str]) -> BlendResult | None:
+        """Run one runtime. Returns a result on success, None to fall through."""
+        # One log per runtime: a shared file means the second attempt erases the
+        # evidence from the first, which is exactly the case worth diagnosing.
+        log_path = out_dir / f"blender-{runtime}.log"
+        logs.append(log_path)
+
+        # A previous runtime may have left a truncated file behind; a stale one
+        # would otherwise be mistaken for this attempt's output.
+        if output_path.exists():
+            output_path.unlink()
+
+        try:
+            code, stdout = _run(cmd, log_path)
+        except subprocess.TimeoutExpired:
+            errors.append(f"{runtime} timed out after {config.BLEND_TIMEOUT_SECONDS}s")
+            return None
+        except Exception as exc:
+            errors.append(f"{runtime}: {type(exc).__name__} - {str(exc)[:160]}")
+            return None
+
+        if output_path.exists() and output_path.stat().st_size > 1024:
+            return BlendResult(
+                blend_path=str(output_path), status="ok", runtime=runtime,
+                preview_path=str(preview_path) if preview_path and preview_path.exists() else None,
+                glb_path=str(glb_path) if glb_path.exists() else None,
+                stats=_parse_stats(stdout), log_path=str(log_path),
+            )
+
+        tail = log_path.read_text(encoding="utf-8")[-400:] if log_path.exists() else ""
+        errors.append(f"{runtime} exited {code}: {tail.strip()[-200:] or 'no output'}")
+        return None
 
     # 1) Real Blender executable
     blender_exe = resolve_blender_path()
     if blender_exe:
-        try:
-            code, stdout = _run(
-                [blender_exe, "--background", "--factory-startup", "--python", script, "--", *script_args],
-                log_path,
-            )
-            if output_path.exists() and output_path.stat().st_size > 1024:
-                stats = _parse_stats(stdout)
-                return BlendResult(
-                    blend_path=str(output_path), status="ok", runtime="blender",
-                    preview_path=str(preview_path) if preview_path and preview_path.exists() else None,
-                    glb_path=str(glb_path) if glb_path.exists() else None,
-                    stats=stats, log_path=str(log_path),
-                )
-            errors.append(f"blender exited {code} without writing the .blend")
-        except subprocess.TimeoutExpired:
-            errors.append(f"blender timed out after {config.BLEND_TIMEOUT_SECONDS}s")
-        except Exception as exc:
-            errors.append(f"blender: {type(exc).__name__} - {str(exc)[:160]}")
+        result = attempt(
+            "blender",
+            [blender_exe, "--background", "--factory-startup", "--python", script, "--", *script_args],
+        )
+        if result:
+            return result
 
     # 2) pip `bpy` module
-    try:
-        code, stdout = _run([sys.executable, script, *script_args], log_path)
-        if output_path.exists() and output_path.stat().st_size > 1024:
-            stats = _parse_stats(stdout)
-            return BlendResult(
-                blend_path=str(output_path), status="ok", runtime="bpy",
-                preview_path=str(preview_path) if preview_path and preview_path.exists() else None,
-                glb_path=str(glb_path) if glb_path.exists() else None,
-                stats=stats, log_path=str(log_path),
-            )
-        tail = log_path.read_text(encoding="utf-8")[-400:] if log_path.exists() else ""
-        errors.append(f"bpy module exited {code}: {tail.strip()[-200:]}")
-    except subprocess.TimeoutExpired:
-        errors.append(f"bpy module timed out after {config.BLEND_TIMEOUT_SECONDS}s")
-    except Exception as exc:
-        errors.append(f"bpy: {type(exc).__name__} - {str(exc)[:160]}")
+    result = attempt("bpy", [sys.executable, script, *script_args])
+    if result:
+        return result
 
     # 3) Remote worker
     if config.BLEND_WORKER_URL:
@@ -264,8 +285,9 @@ def build_blend(
         except Exception as exc:
             errors.append(f"worker: {type(exc).__name__} - {str(exc)[:160]}")
 
+    written = [p for p in logs if p.exists()]
     return BlendResult(
         blend_path=None, status="fallback", runtime="none",
         error_message="; ".join(errors) or "no Blender runtime available",
-        log_path=str(log_path) if log_path.exists() else None,
+        log_path=str(written[-1]) if written else None,
     )
