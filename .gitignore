@@ -1,35 +1,43 @@
-# Environment variables
+# Environment
 .env
+.env.local
 
-# Python virtual environments
+# Virtual environments
 .venv/
 venv/
 env/
 ENV/
 
-# Project-specific generated outputs
+# Generated pipeline output
 runs/
+*.blend
+*.blend1
+*.glb
+*.gltf
 
-# Python cache & compiled files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.egg-info/
+build/
+dist/
 
-# pytest
+# Testing
 .pytest_cache/
 .coverage
 htmlcov/
 
-# Editor/IDE directories
+# Editors
 .vscode/
 .idea/
+*.swp
 
-# OS generated files
+# OS
 .DS_Store
-.DS_Store?
 ._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
+
+# Keep the fallback assets even though *.png is not ignored
+!assets/*.png

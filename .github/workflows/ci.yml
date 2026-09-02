@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # bpy links against these even when running headless.
+      - name: Install Blender runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libglx0 libglvnd0 libegl1 \
+            libx11-6 libxau6 libxdmcp6 libxext6 libxfixes3 libxi6 \
+            libxrender1 libxkbcommon0 libsm6 libice6
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate fallback assets
+        run: python create_fallback_assets.py
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Verify a .blend can actually be built
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from PIL import Image
+          from app.blend_builder import build_blend
+          from app.mesh_gen import build_solid_from_image
+
+          out = Path("ci-out"); out.mkdir(exist_ok=True)
+          img = out / "subject.png"
+          canvas = Image.new("RGB", (256, 256), (240, 240, 240))
+          px = canvas.load()
+          for y in range(256):
+              for x in range(256):
+                  if (x - 128) ** 2 + (y - 128) ** 2 < 70 ** 2:
+                      px[x, y] = (180, 60, 40)
+          canvas.save(img)
+
+          mesh, verts, faces = build_solid_from_image(str(img), out / "mesh", grid=64)
+          result = build_blend(mesh, out, image_path=str(img), make_preview=False)
+          assert result.status == "ok", result.error_message
+          print(f"OK  runtime={result.runtime}  {faces} faces  {result.blend_path}")
+          PY

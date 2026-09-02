@@ -1,127 +1,243 @@
 """
-Module 2: Image Generator
-Converts a Scene JSON dict into a PNG image using HuggingFace InferenceClient.
-Tries multiple models in order before returning the fallback asset.
+Stage 2 - Scene JSON -> reference image.
+
+Providers in cascade order:
+  1. Pollinations   - free, keyless, FLUX-backed. This is what keeps the
+                      public demo working with zero configuration.
+  2. HuggingFace    - Inference Providers, used when a token is present.
+  3. Fallback asset - pre-baked placeholder so the pipeline never stalls.
+
+The image is post-processed for 3D reconstruction: square canvas, subject
+centred, plain background. Image-to-3D models are far more reliable when fed
+a single centred object.
 """
 
+from __future__ import annotations
+
+import io
 import logging
+import time
+import urllib.parse
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from huggingface_hub import InferenceClient
-from huggingface_hub.errors import HfHubHTTPError
+from PIL import Image, ImageFilter
 
 from app import config
 
 logger = logging.getLogger(__name__)
 
+USER_AGENT = "GenFX/2.0 (+https://github.com/praxshant/GenFX-Lite)"
+
+
+@dataclass
+class ImageResult:
+    image_path: str
+    status: str  # "ok" | "fallback"
+    provider_used: str | None = None
+    error_message: str | None = None
+    attempts: list[str] = field(default_factory=list)
+    width: int = 0
+    height: int = 0
+
 
 def build_image_prompt(scene_json: dict[str, Any], user_prompt: str | None = None) -> str:
     """
-    Build a descriptive text prompt for image generation.
+    Return the text prompt for image generation.
 
-    If user_prompt is provided, it is used directly (with cinematic suffixes added).
-    This ensures relevance even when the LLM parser fell back to a generic scene JSON.
-    Otherwise, the prompt is derived from the structured scene_json fields.
+    Preference order: the LLM-authored `image_prompt` (richest), then the raw
+    user prompt, then a prompt assembled from the structured scene fields.
     """
-    if user_prompt:
-        prompt = (
-            user_prompt.strip()
-            + ", cinematic, photorealistic, 8k, film still, VFX production quality"
-        )
-        logger.debug("Using user prompt for image: %s", prompt)
-        return prompt
+    if isinstance(scene_json, dict):
+        authored = scene_json.get("image_prompt")
+        if isinstance(authored, str) and authored.strip():
+            return authored.strip()
 
-    env = scene_json.get("environment", {}).get("type", "scene")
-    tod = scene_json.get("environment", {}).get("time_of_day", "")
-    light = scene_json.get("lighting", {}).get("preset", "")
-    shot = scene_json.get("camera", {}).get("shot_type", "")
-    angle = scene_json.get("camera", {}).get("angle", "")
-    effects_list = scene_json.get("effects", [])
+    if user_prompt and user_prompt.strip():
+        from app.llm_parser import build_heuristic_image_prompt
+
+        return build_heuristic_image_prompt(user_prompt)
+
+    scene_json = scene_json or {}
+    subject = (scene_json.get("subject") or {}).get("name", "")
+    env = (scene_json.get("environment") or {}).get("type", "")
+    tod = (scene_json.get("environment") or {}).get("time_of_day", "")
+    light = (scene_json.get("lighting") or {}).get("preset", "")
+    shot = (scene_json.get("camera") or {}).get("shot_type", "")
     fx = ", ".join(
-        e.get("type", "") for e in effects_list if isinstance(e, dict) and e.get("type")
+        e.get("type", "")
+        for e in (scene_json.get("effects") or [])
+        if isinstance(e, dict) and e.get("type")
     )
-
     parts = [
-        f"cinematic {env} scene",
+        subject or f"cinematic {env or 'studio'} scene",
         tod.replace("_", " ") if tod else "",
         light.replace("_", " ") if light else "",
-        f"{shot} shot" if shot else "",
-        f"{angle} angle" if angle else "",
-        fx if fx else "",
-        "photorealistic",
-        "8k",
-        "film still",
-        "VFX production quality",
+        f"{shot.replace('_', ' ')} shot" if shot else "",
+        fx,
+        "single subject, plain background, photorealistic, high detail",
     ]
-    prompt = ", ".join(p for p in parts if p)
-    logger.debug("Built image prompt from scene JSON: %s", prompt)
-    return prompt
+    return ", ".join(p for p in parts if p)
+
+
+# ── Providers ─────────────────────────────────────────────────────────────────
+
+def _generate_pollinations(prompt: str, width: int, height: int, seed: int | None) -> bytes:
+    """Keyless free generation. Returns raw image bytes."""
+    import requests
+
+    if not config.POLLINATIONS_ENABLED:
+        raise RuntimeError("Pollinations disabled.")
+
+    params = {
+        "width": width,
+        "height": height,
+        "nologo": "true",
+        "model": config.POLLINATIONS_MODEL,
+        "enhance": "false",
+    }
+    if seed is not None:
+        params["seed"] = seed
+
+    url = (
+        f"{config.POLLINATIONS_ENDPOINT}/{urllib.parse.quote(prompt[:1800])}"
+        f"?{urllib.parse.urlencode(params)}"
+    )
+    resp = requests.get(
+        url,
+        headers={"User-Agent": USER_AGENT, "Accept": "image/*"},
+        timeout=config.IMAGE_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    if not resp.content or len(resp.content) < 1024:
+        raise RuntimeError(f"Pollinations returned {len(resp.content)} bytes")
+    return resp.content
+
+
+def _generate_huggingface(prompt: str, width: int, height: int, seed: int | None) -> bytes:
+    """HuggingFace Inference Providers via huggingface_hub."""
+    from huggingface_hub import InferenceClient
+
+    if not config.HUGGINGFACE_API_KEY:
+        raise RuntimeError("HUGGINGFACE_API_KEY missing")
+
+    client = InferenceClient(token=config.HUGGINGFACE_API_KEY, timeout=config.IMAGE_TIMEOUT_SECONDS)
+    last: Exception | None = None
+    for model in config.HF_IMAGE_MODELS:
+        try:
+            pil = client.text_to_image(prompt, model=model, width=width, height=height)
+            buf = io.BytesIO()
+            pil.convert("RGB").save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception as exc:  # try the next model
+            last = exc
+            logger.warning("HF model %s failed: %s", model, str(exc)[:160])
+    raise RuntimeError(f"All HF image models failed: {last}")
+
+
+# Names, not function objects - resolved at call time so providers stay
+# swappable and mockable.
+PROVIDERS: dict[str, str] = {
+    "pollinations": "_generate_pollinations",
+    "huggingface": "_generate_huggingface",
+}
+
+
+def get_provider(name: str):
+    attr = PROVIDERS.get(name)
+    return globals().get(attr) if attr else None
+
+
+# ── Post-processing for 3D reconstruction ─────────────────────────────────────
+
+def prepare_for_reconstruction(img: Image.Image, size: int = 1024) -> Image.Image:
+    """
+    Square-pad the image on a background sampled from its own corners, so the
+    subject stays centred and uncropped. Image-to-3D models expect this.
+    """
+    img = img.convert("RGB")
+    w, h = img.size
+    if w == h:
+        return img.resize((size, size), Image.LANCZOS)
+
+    corners = [
+        img.getpixel((0, 0)),
+        img.getpixel((w - 1, 0)),
+        img.getpixel((0, h - 1)),
+        img.getpixel((w - 1, h - 1)),
+    ]
+    bg = tuple(sum(c[i] for c in corners) // 4 for i in range(3))
+
+    side = max(w, h)
+    canvas = Image.new("RGB", (side, side), bg)
+    canvas.paste(img, ((side - w) // 2, (side - h) // 2))
+    # Soften the seam between padding and image edge.
+    canvas = canvas.filter(ImageFilter.SMOOTH)
+    return canvas.resize((size, size), Image.LANCZOS)
 
 
 def generate_image(
     scene_json: dict[str, Any],
     output_path: str | Path,
     user_prompt: str | None = None,
-) -> tuple[str, str | None]:
+    seed: int | None = None,
+) -> ImageResult:
     """
-    Generate a PNG image using HuggingFace InferenceClient.
+    Generate the reference image, writing a PNG to `output_path`.
 
-    user_prompt: the original text entered by the user. When provided, it is
-    used as the image prompt even if the LLM parser fell back, so the visual
-    output always matches what the user asked for.
-
-    Returns:
-        tuple[str, str | None]: (path_to_image, error_string_or_None)
+    Never raises: on total failure it returns the pre-baked fallback asset with
+    status "fallback" and a diagnostic message.
     """
-    output_target = Path(output_path)
-    fallback_path = str(config.FALLBACK_IMAGE_PATH)
-
-    if not config.HUGGINGFACE_API_KEY or not config.HUGGINGFACE_API_KEY.startswith("hf_"):
-        logger.warning("No valid HUGGINGFACE_API_KEY found. Using fallback image.")
-        return fallback_path, "HUGGINGFACE_API_KEY missing or invalid"
-
-    client = InferenceClient(token=config.HUGGINGFACE_API_KEY)
     prompt = build_image_prompt(scene_json, user_prompt=user_prompt)
+    output_target = Path(output_path).with_suffix(".png")
+    output_target.parent.mkdir(parents=True, exist_ok=True)
+
+    attempts: list[str] = []
     last_error = ""
 
-    for model in config.HF_IMAGE_MODELS:
-        logger.info("Trying HF model via InferenceClient: %s", model)
-        try:
-            # Returns a PIL Image directly — no raw HTTP handling needed
-            pil_image = client.text_to_image(prompt, model=model)
-
-            # Force RGB + explicit PNG format.
-            # Some HF models (e.g. FLUX) return JPEG-encoded data internally;
-            # saving without format="PNG" can produce a corrupt .png that
-            # Blender refuses to load.
-            pil_image = pil_image.convert("RGB")
-            output_target = output_target.with_suffix(".png")
-            output_target.parent.mkdir(parents=True, exist_ok=True)
-            pil_image.save(str(output_target), format="PNG")
-
-            # Verify the file actually landed on disk and is not empty
-            if not output_target.exists() or output_target.stat().st_size < 50:
-                last_error = f"[{model}] Image file missing or corrupt after save"
-                logger.warning(last_error)
-                continue
-
-            logger.info("Image saved to %s (model: %s, %dx%d)",
-                        output_target, model, pil_image.width, pil_image.height)
-            return str(output_target), None
-
-        except HfHubHTTPError as e:
-            status = e.response.status_code if hasattr(e, "response") else "?"
-            last_error = f"[{model}] HTTP {status}: {str(e)[:120]}"
-            logger.warning(last_error)
-            # 404 → model unavailable, skip immediately
-            # 429 / 503 → also skip; InferenceClient doesn't expose retry control
+    for provider_name in config.IMAGE_PROVIDER_ORDER:
+        provider = get_provider(provider_name)
+        if provider is None:
             continue
 
-        except Exception as e:
-            last_error = f"[{model}] Error: {str(e)[:120]}"
-            logger.warning(last_error)
-            continue
+        for attempt in range(config.IMAGE_RETRY_COUNT + 1):
+            try:
+                started = time.time()
+                raw = provider(prompt, config.IMAGE_WIDTH, config.IMAGE_HEIGHT, seed)
+                img = Image.open(io.BytesIO(raw))
+                img.load()
+                img = prepare_for_reconstruction(img)
+                img.save(str(output_target), format="PNG")
 
-    logger.warning("All HF image models failed. Using fallback asset.")
-    return fallback_path, f"All HuggingFace image models failed: {last_error}"
+                if not output_target.exists() or output_target.stat().st_size < 512:
+                    raise RuntimeError("image file missing or truncated after save")
+
+                elapsed = time.time() - started
+                attempts.append(f"{provider_name}: ok in {elapsed:.1f}s")
+                logger.info(
+                    "Image generated via %s in %.1fs -> %s", provider_name, elapsed, output_target
+                )
+                return ImageResult(
+                    image_path=str(output_target),
+                    status="ok",
+                    provider_used=provider_name,
+                    attempts=attempts,
+                    width=img.width,
+                    height=img.height,
+                )
+            except Exception as exc:
+                last_error = f"{provider_name}: {type(exc).__name__} - {str(exc)[:160]}"
+                attempts.append(last_error)
+                logger.warning("%s (attempt %d)", last_error, attempt + 1)
+                if attempt < config.IMAGE_RETRY_COUNT:
+                    time.sleep(1.5 * (attempt + 1))
+
+    logger.warning("All image providers failed; using fallback asset.")
+    return ImageResult(
+        image_path=str(config.FALLBACK_IMAGE_PATH),
+        status="fallback",
+        provider_used=None,
+        error_message=last_error or "No image provider configured.",
+        attempts=attempts,
+    )

@@ -1,695 +1,543 @@
 """
-GenFX Lite — Streamlit UI
-Full pipeline visualization: Prompt → JSON → Image → Blender Render.
-Includes full health checks, structured diagnostics, and file extraction capabilities.
+GenFX - Streamlit front end.
+
+Prompt in, editable .blend out, with an interactive preview of the mesh in
+between so you know what you are downloading before you open Blender.
 """
 
+from __future__ import annotations
+
+import base64
 import json
 import logging
 import sys
-import shutil
 from pathlib import Path
-from PIL import Image
-import io
-import os
 
 import streamlit as st
 
-# ── Path Setup ────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from app import config
-from app.pipeline import run_pipeline
-from app.health import check_runtime_health
+from app import config  # noqa: E402
+from app.health import check_runtime_health  # noqa: E402
+from app.pipeline import list_runs, load_run, run_pipeline  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
 
-# ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="GenFX Lite — AI VFX Pipeline",
-    page_icon="🎬",
+    page_title="GenFX - prompt to editable 3D",
+    page_icon="🧊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── CSS Injection (single block, all styles) ──────────────────────────────────
-st.markdown(
+STAGE_LABELS = {
+    "scene": "Scene brief",
+    "image": "Reference image",
+    "mesh": "3D mesh",
+    "blend": "Blender file",
+}
+
+EXAMPLES = [
+    "a vintage brass steampunk pocket watch",
+    "a ceramic teapot with a bamboo handle",
+    "a chunky retro sneaker, white and orange",
+    "a carved wooden owl figurine",
+    "a matte black wireless gaming mouse",
+    "a potted monstera plant in a terracotta pot",
+]
+
+# ── Styling ───────────────────────────────────────────────────────────────────
+# Streamlit renders this through its markdown parser, where a blank line
+# followed by an indented line becomes a code block. Collapsing the CSS to
+# one non-empty, unindented line per rule is what keeps it from leaking as
+# visible text on the page.
+STYLES = """
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+    --bg-primary:#0F0F0F; --bg-surface:#161616; --bg-elevated:#1F1F1F;
+    --accent:#E8D5B7; --accent-dim:#8B7355;
+    --text-primary:#F0EDE8; --text-secondary:#8A8780; --text-tertiary:#55524D;
+    --border:#2A2A2A; --green:#4CAF7D; --amber:#D4A853; --red:#C0392B;
+    --green-bg:#16301F; --amber-bg:#332714; --red-bg:#331717; --pending-bg:#1C1C1C;
+}
+html, body, [class*="css"] { font-family:'DM Mono',monospace; }
+.stApp { background: var(--bg-primary); }
+.main .block-container { max-width:1280px; padding:2rem 2rem 5rem; }
+
+h1,h2,h3 { font-family:'DM Serif Display',serif !important; color:var(--text-primary) !important;
+           letter-spacing:-0.02em; }
+p, li, label, span, div[data-testid="stMarkdownContainer"] p { color:var(--text-secondary); }
+
+[data-testid="stSidebar"] { background:var(--bg-surface) !important;
+                            border-right:1px solid var(--border) !important; }
+[data-testid="stSidebar"] > div:first-child { padding:1.6rem 1.1rem; }
+
+.genfx-title { font-family:'DM Serif Display',serif; font-size:3rem; color:var(--text-primary);
+               line-height:1.05; margin:0 0 .2rem; }
+.genfx-subtitle { font-size:.74rem; color:var(--text-tertiary); letter-spacing:.2em;
+                  text-transform:uppercase; margin-bottom:1.4rem; }
+
+.wordmark { font-size:1.05rem; font-weight:500; color:var(--accent);
+            letter-spacing:.28em; text-transform:uppercase; }
+.wordmark-sub { font-size:.68rem; color:var(--text-tertiary); letter-spacing:.1em; margin-top:2px; }
+.side-label { font-size:.64rem; color:var(--text-tertiary); letter-spacing:.16em;
+              text-transform:uppercase; margin:1.1rem 0 .5rem; }
+.side-rule { border:none; border-top:1px solid var(--border); margin:1rem 0; }
+
+.status-row { display:flex; align-items:center; gap:8px; margin-bottom:.45rem; font-size:.75rem; }
+.status-row .lbl { color:var(--text-secondary); }
+.status-row .val { margin-left:auto; font-size:.64rem; letter-spacing:.05em; }
+.dot-ok{color:var(--green)} .dot-fb{color:var(--amber)} .dot-pend{color:var(--text-tertiary)}
+.dot-run{color:var(--accent); animation:pulse 1.1s ease-in-out infinite}
+.val-ok{color:var(--green)} .val-fb{color:var(--amber)} .val-pend{color:var(--text-tertiary)}
+.val-run{color:var(--accent)}
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
+.side-detail { font-size:.62rem; color:var(--text-tertiary); margin:-.3rem 0 .6rem 20px;
+               line-height:1.4; word-break:break-word; }
+
+.flow { display:flex; align-items:center; gap:.45rem; flex-wrap:wrap; margin-bottom:1.4rem; }
+.flow-node { background:var(--bg-surface); border:1px solid var(--border); border-radius:5px;
+             padding:5px 11px; font-size:.68rem; color:var(--text-secondary);
+             letter-spacing:.08em; text-transform:uppercase; }
+.flow-node.on { border-color:var(--accent-dim); color:var(--accent); }
+.flow-arrow { color:var(--text-tertiary); font-size:.8rem; }
+
+.card { background:var(--bg-surface); border:1px solid var(--border); border-radius:10px;
+        padding:16px 18px; margin-bottom:.9rem; }
+.card-head { display:flex; align-items:center; justify-content:space-between; gap:8px;
+             flex-wrap:wrap; margin-bottom:.2rem; }
+.card-title { font-family:'DM Serif Display',serif; font-size:1.1rem; color:var(--text-primary); }
+.card-num { font-size:.62rem; color:var(--text-tertiary); letter-spacing:.16em;
+            text-transform:uppercase; }
+.card-note { font-size:.68rem; color:var(--text-tertiary); margin-top:.5rem; line-height:1.5; }
+
+.badge { display:inline-flex; align-items:center; gap:5px; padding:2px 9px; border-radius:4px;
+         font-size:.66rem; letter-spacing:.06em; font-weight:500; }
+.badge-ok{background:var(--green-bg);color:var(--green)}
+.badge-fallback{background:var(--amber-bg);color:var(--amber)}
+.badge-pending{background:var(--pending-bg);color:var(--text-tertiary)}
+.badge-running{background:var(--pending-bg);color:var(--accent)}
+
+.hero { background:linear-gradient(180deg,var(--bg-surface),var(--bg-primary));
+        border:1px solid var(--border); border-radius:12px; padding:20px 22px; margin-bottom:1rem; }
+.hero-kicker { font-size:.64rem; color:var(--accent-dim); letter-spacing:.18em;
+               text-transform:uppercase; }
+.hero-title { font-family:'DM Serif Display',serif; font-size:1.5rem; color:var(--text-primary);
+              margin:.25rem 0 .5rem; }
+.hero-meta { font-size:.7rem; color:var(--text-tertiary); line-height:1.7; }
+
+.stButton>button, .stDownloadButton>button {
+    font-family:'DM Mono',monospace; border-radius:6px; border:1px solid var(--border);
+    background:var(--bg-elevated); color:var(--text-primary); font-size:.78rem;
+    letter-spacing:.04em; transition:all .14s ease; }
+.stButton>button:hover, .stDownloadButton>button:hover {
+    border-color:var(--accent-dim); color:var(--accent); }
+.stButton>button[kind="primary"] { background:var(--accent); color:#141414;
+                                   border-color:var(--accent); font-weight:500; }
+.stButton>button[kind="primary"]:hover { background:#f2e2c9; color:#141414; }
+.stTextArea textarea { background:var(--bg-surface) !important; color:var(--text-primary) !important;
+                       border:1px solid var(--border) !important; font-family:'DM Mono',monospace !important; }
+.diag { font-size:.7rem; color:var(--text-secondary); background:var(--bg-elevated);
+        border-left:2px solid var(--amber); padding:7px 11px; margin-bottom:6px;
+        border-radius:0 4px 4px 0; word-break:break-word; }
+.empty { text-align:center; padding:3.5rem 0; }
+.empty p { font-size:.8rem; color:#33312E; letter-spacing:.12em; text-transform:uppercase; }
+</style>
     """
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
-
-    <style>
-    /* ── Design Tokens ─────────────────────────────────────── */
-    :root {
-        --bg-primary:    #0F0F0F;
-        --bg-surface:    #1A1A1A;
-        --bg-elevated:   #242424;
-        --accent:        #E8D5B7;
-        --accent-dim:    #8B7355;
-        --text-primary:  #F0EDE8;
-        --text-secondary:#8A8780;
-        --text-tertiary: #4A4845;
-        --border:        #2A2A2A;
-        --green:         #4CAF7D;
-        --amber:         #D4A853;
-        --red:           #C0392B;
-        --green-bg:      #1A3A2A;
-        --amber-bg:      #3A2E1A;
-        --red-bg:        #3A1A1A;
-        --pending-bg:    #1F1F1F;
-    }
-
-    /* ── Global Reset ──────────────────────────────────────── */
-    html, body, [class*="css"] {
-        font-family: 'DM Mono', monospace;
-        background-color: var(--bg-primary) !important;
-        color: var(--text-primary) !important;
-    }
-
-    .main .block-container {
-        max-width: 1200px;
-        padding: 2rem 2rem 4rem 2rem;
-        background: var(--bg-primary);
-    }
-
-    /* ── Sidebar ───────────────────────────────────────────── */
-    [data-testid="stSidebar"] {
-        background: var(--bg-surface) !important;
-        border-right: 0.5px solid var(--border) !important;
-        width: 250px !important;
-    }
-    [data-testid="stSidebar"] > div:first-child {
-        padding: 2rem 1.25rem;
-    }
-
-    /* ── Typography ────────────────────────────────────────── */
-    h1, h2, h3 {
-        font-family: 'DM Serif Display', serif !important;
-        color: var(--text-primary) !important;
-        letter-spacing: -0.02em;
-    }
-    h1 { font-size: 2.8rem !important; line-height: 1.1 !important; }
-    h2 { font-size: 1.6rem !important; }
-    h3 { font-size: 1.2rem !important; }
-
-    p, li, label, span {
-        font-family: 'DM Mono', monospace !important;
-        color: var(--text-secondary) !important;
-    }
-
-    /* ── Main Title Block ─────────────────────────────────── */
-    .genfx-title {
-        font-family: 'DM Serif Display', serif;
-        font-size: 3.2rem;
-        font-weight: 400;
-        color: var(--text-primary);
-        line-height: 1.05;
-        margin-bottom: 0.25rem;
-    }
-    .genfx-subtitle {
-        font-family: 'DM Mono', monospace;
-        font-size: 0.82rem;
-        color: var(--text-tertiary);
-        letter-spacing: 0.18em;
-        text-transform: uppercase;
-        margin-bottom: 2rem;
-    }
-
-    /* ── Sidebar Wordmark ─────────────────────────────────── */
-    .sidebar-wordmark {
-        font-family: 'DM Mono', monospace;
-        font-size: 1.1rem;
-        font-weight: 500;
-        color: var(--accent);
-        letter-spacing: 0.25em;
-        text-transform: uppercase;
-    }
-    .sidebar-subtitle {
-        font-family: 'DM Mono', monospace;
-        font-size: 0.72rem;
-        color: var(--text-tertiary);
-        letter-spacing: 0.1em;
-        margin-top: 2px;
-    }
-    .sidebar-divider {
-        border: none;
-        border-top: 0.5px solid var(--border);
-        margin: 1.2rem 0;
-    }
-    .sidebar-section-label {
-        font-family: 'DM Mono', monospace;
-        font-size: 0.68rem;
-        color: var(--text-tertiary);
-        letter-spacing: 0.15em;
-        text-transform: uppercase;
-        margin-bottom: 0.75rem;
-    }
-
-    /* ── Status Badges (sidebar) ─────────────────────────── */
-    .status-row {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        margin-bottom: 0.55rem;
-        font-family: 'DM Mono', monospace;
-        font-size: 0.78rem;
-    }
-    .status-dot-ok     { color: var(--green);  font-size: 1rem; }
-    .status-dot-fb     { color: var(--amber);  font-size: 1rem; }
-    .status-dot-pend   { color: var(--text-tertiary); font-size: 1rem; }
-    .status-dot-run    { color: var(--accent); font-size: 1rem;
-                         animation: pulse 1.2s ease-in-out infinite; }
-    .status-label      { color: var(--text-secondary); }
-    .status-val-ok     { color: var(--green);   margin-left: auto; font-size: 0.68rem; }
-    .status-val-fb     { color: var(--amber);   margin-left: auto; font-size: 0.68rem; }
-    .status-val-pend   { color: var(--text-tertiary); margin-left: auto; font-size: 0.68rem; }
-    .status-val-run    { color: var(--accent);  margin-left: auto; font-size: 0.68rem; }
-
-    @keyframes pulse {
-        0%, 100% { opacity: 1; }
-        50%       { opacity: 0.25; }
-    }
-
-    /* ── Inline Status Badge (cards) ─────────────────────── */
-    .badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 5px;
-        padding: 2px 10px;
-        border-radius: 4px;
-        font-family: 'DM Mono', monospace;
-        font-size: 0.72rem;
-        letter-spacing: 0.06em;
-        font-weight: 500;
-    }
-    .badge-ok      { background: var(--green-bg);   color: var(--green); }
-    .badge-fallback{ background: var(--amber-bg);   color: var(--amber); }
-    .badge-pending { background: var(--pending-bg); color: var(--text-tertiary); }
-    .badge-error   { background: var(--red-bg);     color: var(--red); }
-
-    /* ── Output Cards ─────────────────────────────────────── */
-    .output-card {
-        background: var(--bg-surface);
-        border: 0.5px solid var(--border);
-        border-radius: 8px;
-        padding: 24px;
-        position: relative;
-        overflow: hidden;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.4), 0 4px 16px rgba(0,0,0,0.2);
-        transition: background 150ms ease, transform 150ms ease,
-                    box-shadow 150ms ease;
-        margin-bottom: 1rem;
-    }
-    .output-card::before {
-        content: '';
-        position: absolute;
-        top: 0; left: 0; right: 0;
-        height: 3px;
-        background: var(--accent);
-        border-radius: 8px 8px 0 0;
-    }
-    .output-card:hover {
-        background: var(--bg-elevated);
-        transform: translateY(-2px);
-        box-shadow: 0 4px 12px rgba(0,0,0,0.5), 0 8px 32px rgba(0,0,0,0.3);
-    }
-    .card-stage-num {
-        font-family: 'DM Mono', monospace;
-        font-size: 0.68rem;
-        color: var(--text-tertiary);
-        letter-spacing: 0.15em;
-        text-transform: uppercase;
-        margin-bottom: 4px;
-    }
-    .card-heading {
-        font-family: 'DM Serif Display', serif;
-        font-size: 1.25rem;
-        color: var(--text-primary);
-        margin-bottom: 1rem;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        flex-wrap: wrap;
-        gap: 8px;
-    }
-    .card-caption {
-        font-family: 'DM Mono', monospace;
-        font-size: 0.72rem;
-        color: var(--text-tertiary);
-        margin-top: 0.6rem;
-        letter-spacing: 0.04em;
-    }
-    .card-img {
-        width: 100%;
-        border-radius: 4px;
-        display: block;
-    }
-
-    /* ── Input Area ───────────────────────────────────────── */
-    textarea {
-        background: var(--bg-surface) !important;
-        border: 0.5px solid var(--border) !important;
-        border-radius: 6px !important;
-        color: var(--text-primary) !important;
-        font-family: 'DM Mono', monospace !important;
-        font-size: 0.9rem !important;
-        box-shadow: inset 0 1px 4px rgba(0,0,0,0.3) !important;
-        transition: border-color 150ms ease !important;
-    }
-    textarea:focus {
-        border-color: var(--accent-dim) !important;
-        outline: none !important;
-    }
-
-    /* ── Run Button ───────────────────────────────────────── */
-    .stButton > button {
-        width: 100%;
-        background: var(--accent) !important;
-        color: #0F0F0F !important;
-        font-family: 'DM Mono', monospace !important;
-        font-size: 0.82rem !important;
-        font-weight: 500 !important;
-        letter-spacing: 0.2em !important;
-        text-transform: uppercase !important;
-        border: none !important;
-        border-radius: 6px !important;
-        padding: 0.75rem 1.5rem !important;
-        transition: filter 150ms ease, transform 150ms ease !important;
-        cursor: pointer !important;
-    }
-    .stButton > button:hover {
-        filter: brightness(1.12) !important;
-        transform: translateY(-1px) !important;
-    }
-    
-    .stButton > button:disabled {
-        opacity: 0.5 !important;
-        cursor: not-allowed !important;
-        pointer-events: none !important;
-    }
-
-    /* ── Download Buttons Overrides ───────────────────────── */
-    div[data-testid="stDownloadButton"] > button {
-        background: var(--bg-elevated) !important;
-        color: var(--text-primary) !important;
-        border: 1px solid var(--border) !important;
-        font-family: 'DM Mono', monospace !important;
-        letter-spacing: 0.05em !important;
-        padding: 0.4rem 0.8rem !important;
-        transition: border-color 150ms;
-    }
-    div[data-testid="stDownloadButton"] > button:hover {
-        border-color: var(--accent) !important;
-        color: var(--accent) !important;
-    }
-
-    /* ── JSON viewer override ─────────────────────────────── */
-    [data-testid="stJson"] {
-        background: var(--bg-primary) !important;
-        border: 0.5px solid var(--border) !important;
-        border-radius: 6px !important;
-        font-family: 'DM Mono', monospace !important;
-        font-size: 0.78rem !important;
-    }
-
-    /* ── Pipeline Flow Diagram ────────────────────────────── */
-    .pipeline-flow {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        flex-wrap: wrap;
-        gap: 0;
-        padding: 1.5rem 0;
-        font-family: 'DM Mono', monospace;
-        font-size: 0.75rem;
-        letter-spacing: 0.06em;
-    }
-    .flow-node {
-        background: var(--bg-surface);
-        border: 0.5px solid var(--border);
-        border-radius: 6px;
-        padding: 7px 14px;
-        color: var(--text-secondary);
-        white-space: nowrap;
-    }
-    .flow-node.active { border-color: var(--accent); color: var(--accent); }
-    .flow-arrow {
-        color: var(--text-tertiary);
-        padding: 0 6px;
-        font-size: 0.85rem;
-    }
-
-    /* ── Divider ─────────────────────────────────────────── */
-    hr {
-        border-color: var(--border) !important;
-        margin: 1.5rem 0 !important;
-    }
-    
-    /* ── Diagnostics Text ────────────────────────────────── */
-    .diag-text {
-        font-family: 'DM Mono', monospace;
-        font-size: 0.75rem;
-        color: var(--amber);
-        margin-bottom: 5px;
-    }
-
-    /* ── Scrollbar ───────────────────────────────────────── */
-    ::-webkit-scrollbar { width: 6px; }
-    ::-webkit-scrollbar-track { background: var(--bg-primary); }
-    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-
-    /* ── Hide Streamlit chrome ───────────────────────────── */
-    #MainMenu { visibility: hidden; }
-    footer { visibility: hidden; }
-    [data-testid="stToolbar"] { display: none; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
 
-# ── Health Checks ─────────────────────────────────────────────────────────────
+def inject_css(css: str) -> None:
+    compact = "\n".join(line.strip() for line in css.splitlines() if line.strip())
+    st.markdown(compact, unsafe_allow_html=True)
 
-@st.cache_data(ttl=300)
+
+inject_css(STYLES)
+
+
+# ── Small helpers ─────────────────────────────────────────────────────────────
+
+def badge(status: str) -> str:
+    label = {"ok": "OK", "fallback": "FALLBACK", "running": "WORKING", "pending": "PENDING"}.get(
+        status, status.upper()
+    )
+    dot = "○" if status == "pending" else "●"
+    return f'<span class="badge badge-{status}">{dot} {label}</span>'
+
+
+def status_row(label: str, status: str, detail: str = "") -> str:
+    dot_cls = {"ok": "dot-ok", "fallback": "dot-fb", "running": "dot-run"}.get(status, "dot-pend")
+    val_cls = {"ok": "val-ok", "fallback": "val-fb", "running": "val-run"}.get(status, "val-pend")
+    dot = "○" if status == "pending" else "●"
+    html = (
+        f'<div class="status-row"><span class="{dot_cls}">{dot}</span>'
+        f'<span class="lbl">{label}</span>'
+        f'<span class="val {val_cls}">{status.upper()}</span></div>'
+    )
+    if detail:
+        html += f'<div class="side-detail">{detail}</div>'
+    return html
+
+
+def flow_html(active: str | None = None) -> str:
+    nodes = ["Prompt", "Scene brief", "Image", "Mesh", "Blender file"]
+    keys = ["prompt", "scene", "image", "mesh", "blend"]
+    parts = []
+    for i, (node, key) in enumerate(zip(nodes, keys)):
+        cls = "flow-node on" if active and key == active else "flow-node"
+        parts.append(f'<div class="{cls}">{node}</div>')
+        if i < len(nodes) - 1:
+            parts.append('<span class="flow-arrow">→</span>')
+    return f'<div class="flow">{"".join(parts)}</div>'
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def cached_health() -> dict:
-    """Run full API + asset health probes once every 5 minutes."""
     return check_runtime_health()
 
 
-def get_health() -> dict[str, bool]:
-    """Legacy key-only check — kept for any existing references."""
-    return {
-        "openrouter": bool(config.OPENROUTER_API_KEY and config.OPENROUTER_API_KEY.startswith("sk-or")),
-        "openai": bool(config.OPENAI_API_KEY and config.OPENAI_API_KEY.startswith("sk-")),
-        "hf": bool(config.HUGGINGFACE_API_KEY and config.HUGGINGFACE_API_KEY.startswith("hf_")),
-        "blender": bool(shutil.which(config.BLENDER_PATH)),
-        "fallbacks": all(
-            p.exists() for p in [
-                config.FALLBACK_JSON_PATH,
-                config.FALLBACK_IMAGE_PATH,
-                config.FALLBACK_RENDER_PATH
-            ]
-        )
-    }
-
-# ── Helper HTML Generator ─────────────────────────────────────────────────────
-
-def badge_html(status: str) -> str:
-    """Return an HTML badge string for a given pipeline status value."""
-    cfg = {
-        "ok":       ("●", "badge-ok",       "OK"),
-        "fallback": ("●", "badge-fallback",  "FALLBACK"),
-        "pending":  ("○", "badge-pending",   "PENDING"),
-        "running":  ("●", "badge-ok",        "RUNNING"),
-        "error":    ("●", "badge-error",     "ERROR"),
-    }
-    dot, cls, label = cfg.get(status, ("○", "badge-pending", status.upper()))
-    return f'<span class="badge {cls}">{dot} {label}</span>'
+@st.cache_data(show_spinner=False)
+def file_bytes(path: str, _mtime: float) -> bytes:
+    return Path(path).read_bytes()
 
 
-def sidebar_status_row(label: str, status: str) -> str:
-    """Return an HTML sidebar status row for a pipeline stage."""
-    dot_cls = {
-        "ok":      "status-dot-ok",
-        "fallback":"status-dot-fb",
-        "pending": "status-dot-pend",
-        "running": "status-dot-run",
-    }.get(status, "status-dot-pend")
+def read_file(path: str | None) -> bytes | None:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        return file_bytes(str(p), p.stat().st_mtime)
+    except Exception:
+        return None
 
-    val_cls = {
-        "ok":      "status-val-ok",
-        "fallback":"status-val-fb",
-        "pending": "status-val-pend",
-        "running": "status-val-run",
-    }.get(status, "status-val-pend")
 
-    dot = "●" if status in ("ok", "fallback", "running") else "○"
+def model_viewer(glb_path: str, height: int = 420) -> None:
+    """Interactive turntable of the generated mesh, inlined as a data URI."""
+    data = read_file(glb_path)
+    if not data:
+        st.info("No 3D preview available for this run.")
+        return
+    if len(data) > 24 * 1024 * 1024:
+        st.info("Mesh is too large to preview in the browser - download the .blend instead.")
+        return
 
-    return (
-        f'<div class="status-row">'
-        f'  <span class="{dot_cls}">{dot}</span>'
-        f'  <span class="status-label">{label}</span>'
-        f'  <span class="{val_cls}">{status.upper()}</span>'
-        f'</div>'
+    b64 = base64.b64encode(data).decode("ascii")
+    st.components.v1.html(
+        f"""
+        <script type="module"
+          src="https://cdn.jsdelivr.net/npm/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
+        <style>
+          body {{ margin:0; background:#161616; }}
+          model-viewer {{ width:100%; height:{height}px; background:#161616;
+                          --poster-color:transparent; border-radius:10px; }}
+          .hint {{ font-family:'DM Mono',ui-monospace,monospace; font-size:10px; color:#55524D;
+                   text-align:center; letter-spacing:.14em; text-transform:uppercase;
+                   padding-top:6px; }}
+        </style>
+        <model-viewer id="mv" src="data:model/gltf-binary;base64,{b64}"
+            camera-controls auto-rotate touch-action="pan-y"
+            shadow-intensity="1" exposure="1.1"
+            environment-image="neutral" ar-status="not-presenting"></model-viewer>
+        <div class="hint" id="hint">Drag to orbit · scroll to zoom</div>
+        <script>
+          // The viewer is a CDN module. If it never registers, say so rather
+          // than leaving an unexplained black rectangle on the page.
+          setTimeout(function () {{
+            if (!window.customElements || !customElements.get('model-viewer')) {{
+              document.getElementById('mv').style.display = 'none';
+              document.getElementById('hint').textContent =
+                'Interactive viewer unavailable - see the render below';
+            }}
+          }}, 6000);
+        </script>
+        """,
+        height=height + 30,
     )
 
 
-# ── Session State ─────────────────────────────────────────────────────────────
-if "pipeline_result" not in st.session_state:
-    st.session_state.pipeline_result = None
-if "pipeline_status" not in st.session_state:
-    st.session_state.pipeline_status = {"llm": "pending", "image": "pending", "render": "pending"}
-if "is_running" not in st.session_state:
-    st.session_state.is_running = False
-
-def run_pipeline_action():
-    if st.session_state.scene_prompt.strip():
-        st.session_state.is_running = True
-        st.session_state.pipeline_status = {"llm": "running", "image": "pending", "render": "pending"}
+# ── Session state ─────────────────────────────────────────────────────────────
+for key, default in (
+    ("result", None),
+    ("running", False),
+    ("live_status", {s: "pending" for s in STAGE_LABELS}),
+    ("prompt_input", ""),
+    ("pending_prompt", ""),
+):
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(
-        '<div class="sidebar-wordmark">GENFX</div>'
-        '<div class="sidebar-subtitle">VFX Pipeline Prototype</div>',
+        '<div class="wordmark">GenFX</div>'
+        '<div class="wordmark-sub">prompt → editable 3D</div>',
         unsafe_allow_html=True,
     )
-    st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
-    st.markdown('<div class="sidebar-section-label">Pipeline Status</div>', unsafe_allow_html=True)
+    st.markdown('<hr class="side-rule">', unsafe_allow_html=True)
 
-    status = st.session_state.pipeline_status
+    st.markdown('<div class="side-label">Pipeline</div>', unsafe_allow_html=True)
+    live = st.session_state.live_status
     st.markdown(
-        sidebar_status_row("LLM Parser", status["llm"])
-        + sidebar_status_row("Image Gen", status["image"])
-        + sidebar_status_row("Blender", status["render"]),
+        "".join(status_row(STAGE_LABELS[s], live.get(s, "pending")) for s in STAGE_LABELS),
         unsafe_allow_html=True,
     )
 
-    st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
+    st.markdown('<hr class="side-rule">', unsafe_allow_html=True)
+    st.markdown('<div class="side-label">System</div>', unsafe_allow_html=True)
 
-    # Live API + asset health (cached 5 min)
-    rt = cached_health()
-    st.markdown('<div class="sidebar-section-label">System Checks</div>', unsafe_allow_html=True)
+    health = cached_health()
+    rows = [
+        ("Prompt parser", "llm"),
+        ("Image model", "image"),
+        ("3D model", "mesh"),
+        ("Blender", "blend"),
+        ("Assets", "assets"),
+    ]
     st.markdown(
-        sidebar_status_row("OpenRouter API", "ok" if rt["llm"]["ok"] else "fallback")
-        + sidebar_status_row("HF Image API", "ok" if rt["image"]["ok"] else "fallback")
-        + sidebar_status_row("Blender Exec", "ok" if rt["blender"]["ok"] else "fallback")
-        + sidebar_status_row("Assets Intact", "ok" if rt["assets"]["ok"] else "fallback"),
+        "".join(
+            status_row(
+                label,
+                "ok" if health.get(key, {}).get("ok") else "fallback",
+                health.get(key, {}).get("detail") or health.get(key, {}).get("error") or "",
+            )
+            for label, key in rows
+        ),
         unsafe_allow_html=True,
     )
+    if st.button("Re-check", width="stretch"):
+        cached_health.clear()
+        st.rerun()
 
-    st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="sidebar-section-label">Stack</div>'
-        '<p style="font-size:0.72rem;color:#4A4845;line-height:1.8;">'
-        "OpenAI GPT-4o-mini<br>"
-        "HuggingFace SDXL<br>"
-        "Blender 3.6+ (Cycles)<br>"
-        "Streamlit 1.32+"
-        "</p>",
-        unsafe_allow_html=True,
-    )
+    st.markdown('<hr class="side-rule">', unsafe_allow_html=True)
+    st.markdown('<div class="side-label">Recent</div>', unsafe_allow_html=True)
+    recent = list_runs(limit=8)
+    if not recent:
+        st.markdown(
+            '<div class="side-detail" style="margin-left:0">No runs yet.</div>',
+            unsafe_allow_html=True,
+        )
+    for entry in recent:
+        label = (entry["prompt"] or entry["run_id"])[:32]
+        if st.button(f"↺ {label}", key=f"load_{entry['run_id']}", width="stretch"):
+            loaded = load_run(entry["run_id"])
+            if loaded:
+                st.session_state.result = loaded
+                st.session_state.live_status = loaded.status
+                st.rerun()
 
-# ── Main Content ──────────────────────────────────────────────────────────────
+
+# ── Header ────────────────────────────────────────────────────────────────────
 st.markdown(
-    '<h1 class="genfx-title">GenFX Lite</h1>'
-    '<p class="genfx-subtitle">Prompt → LLM → JSON → SDXL → Image → Blender → Render</p>',
+    '<div class="genfx-title">GenFX</div>'
+    '<div class="genfx-subtitle">Describe an object · get a .blend you can edit</div>',
     unsafe_allow_html=True,
 )
 
-# Pipeline flow diagram (always visible)
-st.markdown(
-    '<div class="pipeline-flow">'
-    '  <div class="flow-node">Prompt</div><span class="flow-arrow">→</span>'
-    '  <div class="flow-node">LLM Parser</div><span class="flow-arrow">→</span>'
-    '  <div class="flow-node">Scene JSON</div><span class="flow-arrow">→</span>'
-    '  <div class="flow-node">SDXL</div><span class="flow-arrow">→</span>'
-    '  <div class="flow-node">Image</div><span class="flow-arrow">→</span>'
-    '  <div class="flow-node">Blender</div><span class="flow-arrow">→</span>'
-    '  <div class="flow-node">Render</div>'
-    '</div>',
-    unsafe_allow_html=True,
+active_stage = next(
+    (s for s in STAGE_LABELS if st.session_state.live_status.get(s) == "running"), None
+)
+st.markdown(flow_html(active_stage), unsafe_allow_html=True)
+
+# ── Input ─────────────────────────────────────────────────────────────────────
+prompt = st.text_area(
+    "Describe the object you want",
+    placeholder="a vintage brass steampunk pocket watch",
+    height=90,
+    disabled=st.session_state.running,
+    key="prompt_input",
 )
 
-st.markdown("<hr>", unsafe_allow_html=True)
+cols = st.columns([1.4, 1, 3.2])
+with cols[0]:
+    go = st.button(
+        "Generate 3D  →", type="primary", width="stretch", disabled=st.session_state.running
+    )
+with cols[1]:
+    fast = st.toggle("Fast", value=False, help="Skip the rendered preview image. Saves ~5s.")
 
-# ── Input Section ─────────────────────────────────────────────────────────────
-user_prompt = st.text_area(
-    label="Describe your scene",
-    placeholder="e.g. cinematic desert at golden hour with dust storms and dramatic light",
-    height=100,
-    label_visibility="visible",
-    disabled=st.session_state.is_running,
-    key="scene_prompt",
-)
+with st.expander("Try an example"):
+    ex_cols = st.columns(3)
+    for i, example in enumerate(EXAMPLES):
+        if ex_cols[i % 3].button(example, key=f"ex_{i}", width="stretch"):
+            st.session_state.prompt_input = example
+            st.rerun()
 
-if st.button("Run Pipeline  →", key="run_btn", disabled=st.session_state.is_running):
-    if user_prompt.strip():
-        st.session_state.is_running = True
-        st.session_state.pipeline_status = {"llm": "running", "image": "pending", "render": "pending"}
+if go:
+    if prompt.strip():
+        st.session_state.pending_prompt = prompt.strip()
+        st.session_state.running = True
+        st.session_state.live_status = {s: "pending" for s in STAGE_LABELS}
         st.rerun()
     else:
-        st.warning("Please enter a scene description before running the pipeline.")
+        st.warning("Describe an object first - a few words is enough.")
 
-# ── Pipeline Execution Intercept ──────────────────────────────────────────────
-if st.session_state.is_running:
-    with st.spinner("Executing Pipeline Stages..."):
-        result = run_pipeline(user_prompt.strip())
-        st.session_state.pipeline_result = result
-        st.session_state.pipeline_status = result["status"]
-    st.session_state.is_running = False
-    st.rerun()
+# ── Execution ─────────────────────────────────────────────────────────────────
+if st.session_state.running:
+    placeholder = st.empty()
+    progress = st.progress(0.0)
+    order = list(STAGE_LABELS)
 
-# ── Results Display ───────────────────────────────────────────────────────────
-result = st.session_state.pipeline_result
-
-if result and not st.session_state.is_running:
-    st.markdown("<hr>", unsafe_allow_html=True)
-    col1, col2, col3 = st.columns(3, gap="medium")
-
-    # ── Card 1: Scene JSON ────────────────────────────────────────────────────
-    with col1:
-        s1 = result["status"].get("llm", "pending")
-        st.markdown(
-            f'<div class="output-card">'
-            f'  <div class="card-stage-num">Stage 01</div>'
-            f'  <div class="card-heading">Scene JSON {badge_html(s1)}</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-        if result.get("scene_json"):
-            json_str = json.dumps(result["scene_json"], indent=2)
-            st.json(result["scene_json"])
-            st.download_button(
-                label="⬇️ Download JSON",
-                data=json_str,
-                file_name=f"scene_{result.get('run_id', 'output')}.json",
-                mime="application/json",
-            )
-            
-        st.markdown(
-            f'<div class="card-caption">Parsed securely via unified dataclass layer.</div>',
+    def on_stage(stage: str, state: str) -> None:
+        st.session_state.live_status[stage] = state
+        done = sum(1 for s in order if st.session_state.live_status.get(s) in ("ok", "fallback"))
+        progress.progress(min(1.0, done / len(order)))
+        placeholder.markdown(
+            f'<div class="card"><div class="card-num">Working</div>'
+            f'<div class="card-title">{STAGE_LABELS.get(stage, stage)} · {state}</div></div>',
             unsafe_allow_html=True,
         )
 
-    # ── Card 2: Generated Image ───────────────────────────────────────────────
-    with col2:
-        s2 = result["status"].get("image", "pending")
-        st.markdown(
-            f'<div class="output-card">'
-            f'  <div class="card-stage-num">Stage 02</div>'
-            f'  <div class="card-heading">Generated Image {badge_html(s2)}</div>'
-            f'</div>',
-            unsafe_allow_html=True,
+    try:
+        result = run_pipeline(
+            st.session_state.pending_prompt,
+            on_stage=on_stage,
+            make_preview=not fast,
         )
-        img_path = result.get("image_path")
-        if img_path:
-            resolved_img_path = Path(img_path).resolve()
-            if resolved_img_path.exists():
-                st.write("Image Size:", os.path.getsize(resolved_img_path))
-                try:
-                    with open(resolved_img_path, "rb") as f:
-                        img_bytes = f.read()
-                    img_obj = Image.open(io.BytesIO(img_bytes))
-                    st.image(img_obj, width="stretch")
-                except Exception as e:
-                    st.error(f"Failed to load image: {e}")
-                
-                with open(resolved_img_path, "rb") as file:
-                    st.download_button(
-                        label="⬇️ Download Image",
-                        data=file,
-                        file_name=f"img_{result.get('run_id', 'output')}.png",
-                        mime="image/png",
-                    )
-                
-        st.markdown(
-            '<div class="card-caption">SDXL validation logic complete.</div>',
-            unsafe_allow_html=True,
-        )
+        st.session_state.result = result
+        st.session_state.live_status = result.status
+    except Exception as exc:  # the pipeline swallows its own errors; this is belt-and-braces
+        st.error(f"Pipeline error: {exc}")
+    finally:
+        st.session_state.running = False
+        progress.empty()
+        placeholder.empty()
+        st.rerun()
 
-    # ── Card 3: Blender Render ────────────────────────────────────────────────
-    with col3:
-        s3 = result["status"].get("render", "pending")
-        st.markdown(
-            f'<div class="output-card">'
-            f'  <div class="card-stage-num">Stage 03</div>'
-            f'  <div class="card-heading">Blender Render {badge_html(s3)}</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-        render_path = result.get("render_path")
-        if render_path:
-            resolved_render_path = Path(render_path).resolve()
-            
-            # Debug info to prove the file is exactly where it should be
-            st.write("Render path:", str(resolved_render_path))
-            st.write("Exists:", resolved_render_path.exists())
-            
-            if resolved_render_path.exists():
-                st.write("Size:", os.path.getsize(resolved_render_path))
-                try:
-                    with open(resolved_render_path, "rb") as f:
-                        render_bytes = f.read()
-                    render_obj = Image.open(io.BytesIO(render_bytes))
-                    st.image(render_obj, width="stretch")
-                except Exception as e:
-                    st.error(f"Failed to load render: {e}")
-                
-                with open(resolved_render_path, "rb") as file:
-                    st.download_button(
-                        label="⬇️ Download Render",
-                        data=file,
-                        file_name=f"render_{result.get('run_id', 'output')}.png",
-                        mime="image/png",
-                    )
-                
-        st.markdown(
-            '<div class="card-caption">Engine: Cycles · Samples: 32</div>',
-            unsafe_allow_html=True,
-        )
+# ── Results ───────────────────────────────────────────────────────────────────
+result = st.session_state.result
 
-    # ── Pipeline summary bar & Diagnostics ────────────────────────────────────
-    st.markdown("<hr>", unsafe_allow_html=True)
-    total_fallbacks = sum(1 for v in result["status"].values() if v == "fallback")
-    total_ok = sum(1 for v in result["status"].values() if v == "ok")
-
-    summary_color = "#4CAF7D" if total_fallbacks == 0 else "#D4A853"
-    summary_msg = (
-        f"Pipeline complete — [{result.get('run_id')}] — {total_ok}/3 stages live, {total_fallbacks}/3 fallback."
-        if total_fallbacks > 0
-        else f"Pipeline complete — [{result.get('run_id')}] — all 3 stages live."
-    )
+if result is None:
     st.markdown(
-        f'<p style="font-family:\'DM Mono\',monospace;font-size:0.78rem;'
-        f'color:{summary_color};text-align:center;letter-spacing:0.06em;">'
-        f"⬡ {summary_msg}</p>",
+        '<div class="empty"><p>Describe an object and press Generate 3D</p></div>',
+        unsafe_allow_html=True,
+    )
+else:
+    blend_bytes = read_file(result.blend_path)
+    stats = result.blend_stats or {}
+
+    st.markdown(
+        f'<div class="hero">'
+        f'  <div class="hero-kicker">{result.run_id} · {result.duration:.1f}s</div>'
+        f'  <div class="hero-title">{result.prompt}</div>'
+        f'  <div class="hero-meta">'
+        f'    {stats.get("polygons", 0):,} polygons · {stats.get("vertices", 0):,} vertices'
+        f'    · Blender {stats.get("blender_version", "-")}'
+        f'    · mesh via {result.providers.get("mesh") or "n/a"}'
+        f'  </div>'
+        f'</div>',
         unsafe_allow_html=True,
     )
 
-    if total_fallbacks > 0:
-        with st.expander("Diagnostics"):
-            st.markdown("### Fallback Trace")
-            diag = result.get("diagnostics", {})
-            if result["status"]["llm"] == "fallback":
-                st.markdown(f'<div class="diag-text">LLM Parser: {diag.get("llm")}</div>', unsafe_allow_html=True)
-            if result["status"]["image"] == "fallback":
-                st.markdown(f'<div class="diag-text">Image Generator: {diag.get("image")}</div>', unsafe_allow_html=True)
-            if result["status"]["render"] == "fallback":
-                st.markdown(f'<div class="diag-text">Blender Runner: {diag.get("render")}</div>', unsafe_allow_html=True)
+    if blend_bytes:
+        dl_cols = st.columns([1.5, 1, 1, 1])
+        dl_cols[0].download_button(
+            "⬇  Download .blend",
+            data=blend_bytes,
+            file_name=f"genfx_{result.run_id}.blend",
+            mime="application/octet-stream",
+            type="primary",
+            width="stretch",
+        )
+        glb = read_file(result.glb_path) or read_file(result.mesh_path)
+        if glb:
+            dl_cols[1].download_button(
+                "⬇  .glb", data=glb, file_name=f"genfx_{result.run_id}.glb",
+                mime="model/gltf-binary", width="stretch",
+            )
+        img = read_file(result.image_path)
+        if img:
+            dl_cols[2].download_button(
+                "⬇  Image", data=img, file_name=f"genfx_{result.run_id}.png",
+                mime="image/png", width="stretch",
+            )
+        if result.scene_json:
+            dl_cols[3].download_button(
+                "⬇  Scene JSON", data=json.dumps(result.scene_json, indent=2),
+                file_name=f"genfx_{result.run_id}.json", mime="application/json",
+                width="stretch",
+            )
+    else:
+        st.error(
+            "No .blend was produced. Open Diagnostics below for the reason - "
+            "usually no Blender runtime is available on this deployment."
+        )
 
-else:
-    if not st.session_state.is_running:
-        # Empty state
+    left, right = st.columns([1.25, 1], gap="large")
+
+    with left:
         st.markdown(
-            '<div style="text-align:center;padding:4rem 0;">'
-            '  <p style="font-family:\'DM Mono\',monospace;font-size:0.85rem;'
-            '     color:#2A2A2A;letter-spacing:0.12em;text-transform:uppercase;">'
-            "     Enter a scene description and click Run Pipeline to begin."
-            "  </p>"
-            "</div>",
+            f'<div class="card"><div class="card-head">'
+            f'<div><div class="card-num">Stage 03 · 04</div>'
+            f'<div class="card-title">3D result</div></div>'
+            f'{badge(result.status.get("blend", "pending"))}</div></div>',
             unsafe_allow_html=True,
         )
+        preview_source = result.glb_path or result.mesh_path
+        if preview_source and Path(preview_source).suffix.lower() in (".glb", ".gltf"):
+            model_viewer(preview_source, height=430)
+        preview_png = read_file(result.preview_path)
+        if preview_png:
+            st.image(preview_png, caption="Rendered from the saved .blend", width="stretch")
+
+    with right:
+        st.markdown(
+            f'<div class="card"><div class="card-head">'
+            f'<div><div class="card-num">Stage 02</div>'
+            f'<div class="card-title">Reference image</div></div>'
+            f'{badge(result.status.get("image", "pending"))}</div></div>',
+            unsafe_allow_html=True,
+        )
+        img = read_file(result.image_path)
+        if img:
+            st.image(img, width="stretch")
+
+        st.markdown(
+            f'<div class="card"><div class="card-head">'
+            f'<div><div class="card-num">Stage 01</div>'
+            f'<div class="card-title">Scene brief</div></div>'
+            f'{badge(result.status.get("scene", "pending"))}</div>'
+            f'<div class="card-note">Drives the image prompt, and the material, '
+            f'lighting and camera inside the .blend.</div></div>',
+            unsafe_allow_html=True,
+        )
+        if result.scene_json:
+            with st.expander("Scene JSON"):
+                st.json(result.scene_json)
+
+    st.markdown(
+        '<div class="card"><div class="card-num">What you get</div>'
+        '<div class="card-note">'
+        'The .blend opens with the mesh centred on the origin and resting on the ground, '
+        'smooth-shaded with a real material, a three-point light rig, and a framed camera '
+        'on a track-to constraint. Textures are packed inside the file, so it is portable. '
+        'Select the object and press Tab to start editing.'
+        '</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    fallbacks = [s for s, v in result.status.items() if v == "fallback"]
+    with st.expander(f"Diagnostics{f' · {len(fallbacks)} stage(s) degraded' if fallbacks else ''}"):
+        st.markdown(
+            f'<div class="card-note">Timings: '
+            + " · ".join(f"{STAGE_LABELS[s]} {result.timings.get(s, 0):.1f}s" for s in STAGE_LABELS)
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+        for stage in STAGE_LABELS:
+            attempts = result.attempts.get(stage) or []
+            diag = result.diagnostics.get(stage)
+            if not attempts and not diag:
+                continue
+            st.markdown(f"**{STAGE_LABELS[stage]}** · `{result.providers.get(stage) or '-'}`")
+            for line in attempts:
+                st.markdown(f'<div class="diag">{line}</div>', unsafe_allow_html=True)
+            if diag:
+                st.markdown(f'<div class="diag">{diag}</div>', unsafe_allow_html=True)
+        st.caption(f"Run directory: {result.run_dir}")
