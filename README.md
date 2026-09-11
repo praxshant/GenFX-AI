@@ -56,6 +56,9 @@ Open http://localhost:8501, type *"a carved wooden owl figurine"*, press
 No `.env` is required. To go further, `cp .env.example .env` — every setting is
 documented there.
 
+Step-by-step deployment for every target, known bugs and the roadmap are in
+[Technical.md](Technical.md).
+
 ---
 
 ## How each stage degrades
