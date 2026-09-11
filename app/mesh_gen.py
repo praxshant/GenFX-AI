@@ -7,7 +7,8 @@ Three tiers, tried in order, so there is always a mesh:
                 public Hugging Face Space's Gradio API. Free; an HF token buys
                 more ZeroGPU quota and unlocks the textured pipelines.
   2. "depth"  - monocular depth estimation, then a displaced + inflated mesh.
-                Runs locally, textured with the source image.
+                Runs locally when the optional transformers + torch are
+                installed; textured with the source image.
   3. "relief" - no model at all: the subject is segmented from its background
                 and inflated with a distance transform. Pure numpy, always
                 works, always textured.
@@ -22,6 +23,7 @@ import logging
 import time
 import urllib.request
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -177,44 +179,72 @@ def _harvest_mesh_file(result, base_url: str, dest_dir: Path) -> tuple[Path, boo
     return None
 
 
-def make_gradio_client(src: str, token: str | None = None):
+def make_gradio_client(src: str, token: str | None = None, http_timeout: float = 60.0):
     """
     Build a gradio_client.Client across versions: the token kwarg was renamed
-    from `hf_token` to `token`, and a bad kwarg is a hard TypeError.
+    from `hf_token` to `token`, `httpx_kwargs` is missing from old releases,
+    and a bad kwarg is a hard TypeError.
     """
     from gradio_client import Client
 
     token = token or config.HUGGINGFACE_API_KEY or None
-    for kwargs in ({"token": token}, {"hf_token": token}, {}):
-        try:
-            return Client(src, verbose=False, **kwargs)
-        except TypeError as exc:
-            if "unexpected keyword" not in str(exc):
-                raise
+    for auth in ({"token": token}, {"hf_token": token}, {}):
+        for extra in ({"httpx_kwargs": {"timeout": http_timeout}}, {}):
+            try:
+                return Client(src, verbose=False, **auth, **extra)
+            except TypeError as exc:
+                if "unexpected keyword" not in str(exc):
+                    raise
     return Client(src, verbose=False)
+
+
+def _call_with_deadline(client, deadline: float, api_name: str, **kwargs):
+    """
+    Submit a Space job and wait no longer than the tier's remaining budget.
+
+    `predict()` blocks for as long as the Space's queue does, which on an
+    anonymous ZeroGPU quota can be indefinitely - and the page waits with it.
+    """
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        raise TimeoutError("mesh time budget exhausted")
+    job = client.submit(api_name=api_name, **kwargs)
+    try:
+        return job.result(timeout=remaining)
+    except Exception:
+        try:
+            job.cancel()
+        except Exception:
+            pass
+        raise
 
 
 def generate_mesh_via_space(image_path: str, out_dir: Path) -> tuple[Path, str, bool]:
     """
-    Try each configured Space until one returns a mesh.
+    Try each configured Space until one returns a mesh, within a total budget
+    of MESH_SPACE_TIMEOUT seconds shared by all of them.
     Returns (mesh_path, space_id, textured). Raises on total failure.
     """
     from gradio_client import handle_file
 
     errors: list[str] = []
+    deadline = time.time() + config.MESH_SPACE_TIMEOUT
 
     for space_id in config.MESH_SPACES:
+        if time.time() >= deadline:
+            errors.append(f"{space_id}: skipped, {config.MESH_SPACE_TIMEOUT}s budget exhausted")
+            continue
         try:
             logger.info("Requesting mesh from Space %s", space_id)
             client = make_gradio_client(space_id)
 
             try:  # TRELLIS-style session-scoped Spaces
-                client.predict(api_name="/start_session")
+                _call_with_deadline(client, min(deadline, time.time() + 20), "/start_session")
             except Exception:
                 pass
 
             api_name, kwargs = _space_payload(space_id, image_path, handle_file)
-            result = client.predict(api_name=api_name, **kwargs)
+            result = _call_with_deadline(client, deadline, api_name, **kwargs)
 
             found = _harvest_mesh_file(result, client.src, out_dir)
             if found is None:
@@ -236,39 +266,35 @@ def generate_mesh_via_space(image_path: str, out_dir: Path) -> tuple[Path, str, 
 # Tier 2/3 - local mesh construction
 # ══════════════════════════════════════════════════════════════════════════════
 
+@lru_cache(maxsize=1)
+def _depth_pipeline():
+    """
+    The transformers depth model, loaded once per process. Building it per run
+    re-reads the weights from disk every time; the first build downloads them.
+    Returns None when transformers/torch are not installed - they are optional.
+    """
+    try:
+        from transformers import pipeline  # type: ignore
+
+        return pipeline("depth-estimation", model=config.DEPTH_MODEL, device=-1)
+    except Exception as exc:
+        logger.info("Local depth model unavailable: %s", str(exc)[:140])
+        return None
+
+
 def _estimate_depth_local(img: Image.Image) -> np.ndarray | None:
     """Monocular depth via transformers, if torch happens to be installed."""
     if not config.DEPTH_LOCAL_ENABLED:
         return None
-    try:
-        from transformers import pipeline  # type: ignore
-    except Exception:
+    pipe = _depth_pipeline()
+    if pipe is None:
         return None
     try:
-        pipe = pipeline("depth-estimation", model=config.DEPTH_MODEL, device=-1)
-        out = pipe(img)
-        depth = np.array(out["depth"], dtype=np.float32)
+        depth = np.array(pipe(img)["depth"], dtype=np.float32)
         rng = depth.max() - depth.min()
         return (depth - depth.min()) / rng if rng > 1e-6 else None
     except Exception as exc:
-        logger.info("Local depth estimation unavailable: %s", str(exc)[:140])
-        return None
-
-
-def _estimate_depth_hf(image_path: str) -> np.ndarray | None:
-    """Monocular depth via the HuggingFace Inference API, if a token is set."""
-    if not config.HUGGINGFACE_API_KEY:
-        return None
-    try:
-        from huggingface_hub import InferenceClient
-
-        client = InferenceClient(token=config.HUGGINGFACE_API_KEY, timeout=60)
-        depth_img = client.depth_estimation(image_path, model=config.DEPTH_MODEL)
-        depth = np.array(depth_img.convert("F"), dtype=np.float32)
-        rng = depth.max() - depth.min()
-        return (depth - depth.min()) / rng if rng > 1e-6 else None
-    except Exception as exc:
-        logger.info("HF depth estimation unavailable: %s", str(exc)[:140])
+        logger.info("Local depth estimation failed: %s", str(exc)[:140])
         return None
 
 
@@ -675,13 +701,9 @@ def generate_mesh(image_path: str, out_dir: str | Path) -> MeshResult:
 
             if tier == "depth":
                 img = Image.open(image_path).convert("RGB")
-                # `a or b` would ask numpy for the truth value of a whole depth
-                # array, which raises - and would silently defeat this tier.
                 depth = _estimate_depth_local(img)
                 if depth is None:
-                    depth = _estimate_depth_hf(image_path)
-                if depth is None:
-                    raise RuntimeError("no depth backend available")
+                    raise RuntimeError("no depth backend (install transformers + torch)")
                 t0 = time.time()
                 obj, nv, nf = build_solid_from_image(image_path, out_dir, depth_map=depth)
                 attempts.append(f"depth: ok in {time.time() - t0:.1f}s")

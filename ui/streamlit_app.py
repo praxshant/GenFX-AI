@@ -282,6 +282,7 @@ for key, default in (
     ("prompt_input", ""),
     ("pending_prompt", ""),
     ("fatal_error", None),
+    ("my_runs", []),
 ):
     if key not in st.session_state:
         st.session_state[key] = default
@@ -331,7 +332,11 @@ with st.sidebar:
 
     st.markdown('<hr class="side-rule">', unsafe_allow_html=True)
     st.markdown('<div class="side-label">Recent</div>', unsafe_allow_html=True)
-    recent = list_runs(limit=8)
+    # Only this visitor's runs, unless the operator opted into a shared gallery.
+    recent = list_runs(
+        limit=8,
+        run_ids=None if config.SHARED_GALLERY else set(st.session_state.my_runs),
+    )
     if not recent:
         st.markdown(
             '<div class="side-detail" style="margin-left:0">No runs yet.</div>',
@@ -429,6 +434,7 @@ if st.session_state.running:
             make_preview=not fast,
         )
         st.session_state.result = result
+        st.session_state.my_runs.append(result.run_id)
         st.session_state.live_status = result.status
         st.session_state.fatal_error = None
     except Exception as exc:  # the pipeline swallows its own errors; this is belt-and-braces
@@ -505,10 +511,18 @@ else:
                 width="stretch",
             )
     else:
-        st.error(
-            "No .blend was produced. Open Diagnostics below for the reason - "
-            "usually no Blender runtime is available on this deployment."
+        # Name the first stage that gave up rather than guessing at a cause. A
+        # degraded scene brief never stops a build, so it is not a candidate.
+        failed = next(
+            (s for s in ("image", "mesh", "blend")
+             if result.status.get(s) != "ok" and result.diagnostics.get(s)),
+            None,
         )
+        reason = (
+            f"{STAGE_LABELS[failed]}: {result.diagnostics[failed]}" if failed
+            else "see Diagnostics below"
+        )
+        st.error(f"No .blend was produced - {reason}")
 
     left, right = st.columns([1.25, 1], gap="large")
 

@@ -28,7 +28,11 @@ from app import config
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = "GenFX/2.0 (+https://github.com/praxshant/GenFX-Lite)"
+USER_AGENT = "GenFX/2.0 (+https://github.com/praxshant/GenFX-AI)"
+
+
+class ProviderUnavailable(Exception):
+    """Raised when a provider is disabled or has no key - retrying cannot help."""
 
 
 @dataclass
@@ -88,7 +92,7 @@ def _generate_pollinations(prompt: str, width: int, height: int, seed: int | Non
     import requests
 
     if not config.POLLINATIONS_ENABLED:
-        raise RuntimeError("Pollinations disabled.")
+        raise ProviderUnavailable("Pollinations disabled.")
 
     params = {
         "width": width,
@@ -117,10 +121,10 @@ def _generate_pollinations(prompt: str, width: int, height: int, seed: int | Non
 
 def _generate_huggingface(prompt: str, width: int, height: int, seed: int | None) -> bytes:
     """HuggingFace Inference Providers via huggingface_hub."""
-    from huggingface_hub import InferenceClient
-
     if not config.HUGGINGFACE_API_KEY:
-        raise RuntimeError("HUGGINGFACE_API_KEY missing")
+        raise ProviderUnavailable("HUGGINGFACE_API_KEY missing")
+
+    from huggingface_hub import InferenceClient
 
     client = InferenceClient(token=config.HUGGINGFACE_API_KEY, timeout=config.IMAGE_TIMEOUT_SECONDS)
     last: Exception | None = None
@@ -239,6 +243,10 @@ def generate_image(
                     width=img.width,
                     height=img.height,
                 )
+            except ProviderUnavailable as exc:
+                last_error = f"{provider_name}: {exc}"
+                attempts.append(last_error)
+                break  # unconfigured - no point waiting and asking again
             except Exception as exc:
                 last_error = f"{provider_name}: {type(exc).__name__} - {str(exc)[:160]}"
                 attempts.append(last_error)

@@ -341,6 +341,26 @@ class TestImageGeneration:
         assert result.status == "ok"
         assert result.provider_used == "huggingface"
 
+    def test_unconfigured_provider_is_not_retried(self, tmp_path):
+        """No key will not appear between attempts - retrying only adds sleeps."""
+        from app.image_gen import ProviderUnavailable as ImageProviderUnavailable
+
+        calls = []
+
+        def unavailable(*_args):
+            calls.append(1)
+            raise ImageProviderUnavailable("no key")
+
+        with patch.object(config, "IMAGE_PROVIDER_ORDER", ["huggingface"]), \
+             patch.object(config, "IMAGE_RETRY_COUNT", 3), \
+             patch("app.image_gen._generate_huggingface", unavailable), \
+             patch("app.image_gen.time.sleep") as sleep:
+            result = generate_image({}, tmp_path / "img.png", user_prompt="a mug")
+
+        assert len(calls) == 1
+        sleep.assert_not_called()
+        assert result.status == "fallback"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Stage 3 - mesh generation
@@ -542,7 +562,6 @@ class TestMeshCascade:
         with patch.object(config, "MESH_PROVIDER_ORDER", ["space", "depth", "relief"]), \
              patch("app.mesh_gen.generate_mesh_via_space", side_effect=RuntimeError("no quota")), \
              patch("app.mesh_gen._estimate_depth_local", return_value=None), \
-             patch("app.mesh_gen._estimate_depth_hf", return_value=None), \
              patch.object(config, "RELIEF_GRID", 60):
             result = generate_mesh(str(subject_image), tmp_path / "mesh")
 
@@ -578,6 +597,45 @@ class TestMeshCascade:
 
         assert result.method == "space"
         assert result.provider_used == "frogleo/Image-to-3D"
+
+    def test_space_calls_are_bounded_by_the_budget(self, subject_image, tmp_path):
+        """
+        predict() waits as long as a Space's queue does. Each job must be given
+        no more than what is left of MESH_SPACE_TIMEOUT, and cancelled on expiry.
+        """
+        from concurrent.futures import TimeoutError as FutureTimeout
+
+        timeouts: list[float] = []
+        jobs: list[MagicMock] = []
+
+        def submit(api_name, **_kwargs):
+            job = MagicMock()
+
+            def result(timeout=None):
+                timeouts.append(timeout)
+                raise FutureTimeout()
+
+            job.result.side_effect = result
+            jobs.append(job)
+            return job
+
+        client = MagicMock()
+        client.submit.side_effect = submit
+        fake_gradio = MagicMock()
+        fake_gradio.handle_file = lambda p: p
+
+        with patch.dict(sys.modules, {"gradio_client": fake_gradio}), \
+             patch.object(config, "MESH_SPACES", ["frogleo/Image-to-3D", "tencent/Hunyuan3D-2.1"]), \
+             patch.object(config, "MESH_SPACE_TIMEOUT", 5), \
+             patch("app.mesh_gen.make_gradio_client", return_value=client):
+            from app.mesh_gen import generate_mesh_via_space
+
+            with pytest.raises(RuntimeError):
+                generate_mesh_via_space(str(subject_image), tmp_path / "mesh")
+
+        assert timeouts, "no job was waited on"
+        assert all(t is not None and t <= 5 for t in timeouts)
+        assert all(job.cancel.called for job in jobs)
 
     def test_every_tier_failing_is_reported_not_raised(self, tmp_path):
         missing = tmp_path / "nope.png"
@@ -690,6 +748,97 @@ class TestBlendBuilder:
         assert result.status == "fallback"
         assert result.runtime == "none"
         assert result.blend_path is None
+
+    def test_a_bpy_probe_timeout_is_not_cached(self):
+        """A cold container timing out says nothing about bpy; ask again later."""
+        import subprocess
+
+        from app import blend_builder
+
+        with patch.object(blend_builder, "_BPY_AVAILABLE", None), \
+             patch("app.blend_builder.subprocess.run",
+                   side_effect=subprocess.TimeoutExpired("python", 120)):
+            assert blend_builder.has_bpy_module() is False
+            assert blend_builder._BPY_AVAILABLE is None
+
+
+class TestWorkerHandOff:
+    def _obj_dir(self, tmp_path: Path) -> Path:
+        mesh_dir = tmp_path / "mesh"
+        mesh_dir.mkdir()
+        (mesh_dir / "mesh.obj").write_text("mtllib mesh.mtl\nv 0 0 0\n")
+        (mesh_dir / "mesh.mtl").write_text("newmtl m\nmap_Kd texture.png\n")
+        Image.new("RGB", (4, 4)).save(mesh_dir / "texture.png")
+        return mesh_dir / "mesh.obj"
+
+    def test_an_obj_travels_with_its_material_and_texture(self, tmp_path):
+        from app.blend_builder import bundle_mesh, extract_mesh_bundle
+
+        bundle = bundle_mesh(self._obj_dir(tmp_path), tmp_path)
+        assert bundle.suffix == ".zip"
+
+        mesh = extract_mesh_bundle(bundle, tmp_path / "unpacked")
+        assert mesh.name == "mesh.obj"
+        assert (mesh.parent / "mesh.mtl").exists()
+        assert (mesh.parent / "texture.png").exists()
+
+    def test_a_glb_is_uploaded_as_it_is(self, tmp_path):
+        from app.blend_builder import bundle_mesh
+
+        glb = tmp_path / "mesh.glb"
+        glb.write_bytes(b"glTF")
+        assert bundle_mesh(glb, tmp_path) == glb
+
+    def test_a_bundle_cannot_write_outside_its_directory(self, tmp_path):
+        import zipfile
+
+        from app.blend_builder import extract_mesh_bundle
+
+        evil = tmp_path / "evil.zip"
+        with zipfile.ZipFile(evil, "w") as zf:
+            zf.writestr("../escaped.obj", "v 0 0 0\n")
+        with pytest.raises(ValueError):
+            extract_mesh_bundle(evil, tmp_path / "out")
+        assert not (tmp_path / "escaped.obj").exists()
+
+    def test_the_worker_gets_the_texture_image_and_token(self, tmp_path):
+        from app.blend_builder import build_blend_via_worker
+
+        served = tmp_path / "served"
+        served.mkdir()
+        (served / "scene.blend").write_bytes(b"B" * 2048)
+        (served / "preview.glb").write_bytes(b"glTF")
+        Image.new("RGB", (4, 4)).save(served / "preview.png")
+        ref = tmp_path / "ref.png"
+        Image.new("RGB", (4, 4)).save(ref)
+
+        client = MagicMock()
+        client.src = "https://worker.hf.space"
+        client.predict.return_value = (
+            str(served / "scene.blend"), str(served / "preview.glb"),
+            str(served / "preview.png"), "Built with bpy",
+        )
+        fake_gradio = MagicMock()
+        fake_gradio.handle_file = lambda p: p
+
+        out = tmp_path / "out"
+        out.mkdir()
+        with patch.dict(sys.modules, {"gradio_client": fake_gradio}), \
+             patch("app.mesh_gen.make_gradio_client", return_value=client), \
+             patch.object(config, "BLEND_WORKER_TOKEN", "s3cret"):
+            result = build_blend_via_worker(
+                self._obj_dir(tmp_path), out, None, image_path=str(ref), make_preview=True
+            )
+
+        sent = client.predict.call_args.kwargs
+        assert sent["mesh_file"].endswith(".zip"), "OBJ went without its texture"
+        assert sent["image_file"] == str(ref)
+        assert sent["token"] == "s3cret"
+        assert sent["make_preview"] is True
+        assert result.status == "ok"
+        assert Path(result.blend_path).exists()
+        assert result.glb_path and Path(result.glb_path).exists()
+        assert result.preview_path and Path(result.preview_path).exists()
 
 
 def _has_blend_runtime() -> bool:
@@ -847,6 +996,40 @@ class TestPipeline:
         assert Path(result.run_dir, "scene.json").exists()
         for stage in ("scene", "image", "mesh", "blend"):
             assert result.diagnostics[stage], f"{stage} should explain itself"
+
+    def test_a_placeholder_image_is_never_meshed(self, tmp_path):
+        """
+        Meshing the fallback placeholder produced a solid "FALLBACK IMAGE" sign
+        and reported the run as a success.
+        """
+        with patch.object(config, "RUNS_DIR", tmp_path / "runs"), \
+             patch.object(config, "OLLAMA_ENABLED", False), \
+             patch.object(config, "OPENROUTER_API_KEY", ""), \
+             patch.object(config, "OPENAI_API_KEY", ""), \
+             patch.object(config, "HUGGINGFACE_API_KEY", ""), \
+             patch.object(config, "IMAGE_PROVIDER_ORDER", []), \
+             patch("app.pipeline.generate_mesh") as mesh, \
+             patch("app.pipeline.build_blend") as blend:
+            result = run_pipeline("a brass telescope")
+
+        mesh.assert_not_called()
+        blend.assert_not_called()
+        assert result.ok is False
+        assert "no reference image" in result.diagnostics["mesh"]
+        assert "no reference image" in result.diagnostics["blend"]
+
+    def test_the_gallery_can_be_limited_to_ones_own_runs(self, tmp_path):
+        with patch.object(config, "RUNS_DIR", tmp_path / "runs"), \
+             patch.object(config, "OLLAMA_ENABLED", False), \
+             patch.object(config, "OPENROUTER_API_KEY", ""), \
+             patch.object(config, "OPENAI_API_KEY", ""), \
+             patch.object(config, "HUGGINGFACE_API_KEY", ""), \
+             patch.object(config, "IMAGE_PROVIDER_ORDER", []):
+            mine = run_pipeline("a mug")
+            run_pipeline("someone else's lamp")
+            listed = list_runs(limit=5, run_ids={mine.run_id})
+
+        assert [entry["run_id"] for entry in listed] == [mine.run_id]
 
     def test_stage_callback_reports_progress(self, tmp_path):
         seen: list[tuple[str, str]] = []

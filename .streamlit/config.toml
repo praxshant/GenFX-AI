@@ -8,13 +8,13 @@ font = "monospace"
 
 [server]
 headless = true
-enableCORS = false
 enableXsrfProtection = true
-maxUploadSize = 50
 
 [browser]
 gatherUsageStats = false
 
 [client]
 toolbarMode = "minimal"
-showErrorDetails = true
+# Tracebacks name files, paths and settings; a public deployment should not
+# show them to visitors. Pipeline diagnostics are still shown in the app.
+showErrorDetails = false

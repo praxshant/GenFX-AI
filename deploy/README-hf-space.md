@@ -36,5 +36,6 @@ often.
 | `HUGGINGFACE_API_KEY`   | Higher 3D quota, textured meshes, backup image model |
 | `OPENROUTER_API_KEY`    | Better scene briefs and image prompts                |
 | `GENFX_BLEND_WORKER`    | Offload `.blend` building to a second Space          |
+| `GENFX_WORKER_TOKEN`    | The worker's shared secret, if it has one            |
 
-Source: https://github.com/praxshant/GenFX-Lite
+Source: https://github.com/praxshant/GenFX-AI

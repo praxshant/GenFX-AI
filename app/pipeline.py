@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 STAGES = ("scene", "image", "mesh", "blend")
 
 
+class _Skipped(Exception):
+    """A stage that had nothing to work with - reported, not logged as a crash."""
+
+
 @dataclass
 class RunResult:
     run_id: str
@@ -160,16 +164,27 @@ def run_pipeline(
         announce("image", "fallback")
     result.timings["image"] = time.time() - t0
 
+    # With no real reference image there is nothing to reconstruct. Meshing the
+    # placeholder would hand the artist a solid "FALLBACK IMAGE" sign, reported
+    # as a successful run.
+    no_reference = result.status["image"] != "ok"
+    skipped = "skipped: no reference image was generated (see the image stage)"
+
     # ── Stage 3: image -> mesh ────────────────────────────────────────────────
     announce("mesh", "running")
     t0 = time.time()
     try:
+        if no_reference:
+            raise _Skipped(skipped)
         mesh = generate_mesh(result.image_path, run_dir / "mesh")
         result.mesh_path = mesh.mesh_path
         result.providers["mesh"] = f"{mesh.method}:{mesh.provider_used}" if mesh.provider_used else mesh.method
         result.diagnostics["mesh"] = mesh.error_message
         result.attempts["mesh"] = mesh.attempts
         announce("mesh", mesh.status)
+    except _Skipped as exc:
+        result.diagnostics["mesh"] = str(exc)
+        announce("mesh", "fallback")
     except Exception as exc:
         logger.exception("Stage 3 crashed")
         result.diagnostics["mesh"] = f"unhandled: {type(exc).__name__} - {exc}"
@@ -180,8 +195,10 @@ def run_pipeline(
     announce("blend", "running")
     t0 = time.time()
     try:
+        if no_reference:
+            raise _Skipped(skipped)
         if not result.mesh_path:
-            raise RuntimeError("no mesh to build from")
+            raise _Skipped("skipped: no mesh to build from (see the mesh stage)")
         blend = build_blend(
             mesh_path=result.mesh_path,
             out_dir=run_dir,
@@ -196,6 +213,9 @@ def run_pipeline(
         result.providers["blend"] = blend.runtime
         result.diagnostics["blend"] = blend.error_message
         announce("blend", blend.status)
+    except _Skipped as exc:
+        result.diagnostics["blend"] = str(exc)
+        announce("blend", "fallback")
     except Exception as exc:
         logger.exception("Stage 4 crashed")
         result.diagnostics["blend"] = f"unhandled: {type(exc).__name__} - {exc}"
@@ -237,13 +257,22 @@ def load_run(run_id: str) -> RunResult | None:
         return None
 
 
-def list_runs(limit: int = 20) -> list[dict[str, Any]]:
-    """Recent runs, newest first, for the gallery."""
+def list_runs(limit: int = 20, run_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    """
+    Recent runs, newest first, for the gallery.
+
+    `run_ids` restricts the listing to those runs - the ones this visitor made -
+    so a shared deployment does not show one person's work to the next.
+    """
     if not config.RUNS_DIR.exists():
         return []
     out: list[dict[str, Any]] = []
     dirs = sorted(
-        (p for p in config.RUNS_DIR.iterdir() if p.is_dir() and p.name.startswith("run_")),
+        (
+            p for p in config.RUNS_DIR.iterdir()
+            if p.is_dir() and p.name.startswith("run_")
+            and (run_ids is None or p.name in run_ids)
+        ),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )

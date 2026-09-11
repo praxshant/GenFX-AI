@@ -18,5 +18,9 @@ huggingface_hub>=0.25.0     # optional image + depth backends
 # Blender binary (BLENDER_PATH) or a remote worker (GENFX_BLEND_WORKER).
 bpy==4.5.3 ; python_version >= "3.11" and python_version < "3.12"
 
-# ── Tests ─────────────────────────────────────────────────────────────────────
-pytest>=7.4.0
+# ── Optional ──────────────────────────────────────────────────────────────────
+# The local depth mesh tier runs only when these are installed. They are large
+# (torch alone is ~1 GB), so they are left out of the default install:
+#   pip install transformers torch
+#
+# Test tooling lives in requirements-dev.txt, out of the production image.

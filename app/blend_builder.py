@@ -20,8 +20,8 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 
 from app import config
@@ -73,23 +73,30 @@ def resolve_blender_path(configured_path: str | None = None) -> str | None:
     return None
 
 
-@lru_cache(maxsize=1)
+_BPY_AVAILABLE: bool | None = None
+
+
 def has_bpy_module() -> bool:
     """
     True when `import bpy` works in a fresh subprocess of this interpreter.
 
     Cached: importing bpy costs seconds and hundreds of megabytes, and the
-    health panel asks this on every page load. The answer cannot change while
-    the process is alive.
+    health panel asks this on every page load. Only a definite answer is
+    cached - a timeout on a cold container says nothing about bpy, and caching
+    it would report "no Blender" for the life of the process.
     """
+    global _BPY_AVAILABLE
+    if _BPY_AVAILABLE is not None:
+        return _BPY_AVAILABLE
     try:
         proc = subprocess.run(
             [sys.executable, "-c", "import bpy; print(bpy.app.version_string)"],
             capture_output=True, text=True, timeout=120,
         )
-        return proc.returncode == 0
     except Exception:
         return False
+    _BPY_AVAILABLE = proc.returncode == 0
+    return _BPY_AVAILABLE
 
 
 def describe_runtime() -> dict[str, object]:
@@ -145,45 +152,125 @@ def _run(cmd: list[str], log_path: Path) -> tuple[int, str]:
     return proc.returncode, proc.stdout or ""
 
 
-def build_blend_via_worker(mesh_path: Path, out_dir: Path, scene_json_path: Path | None) -> BlendResult:
+# ── Remote worker ─────────────────────────────────────────────────────────────
+
+MESH_FILE_EXTENSIONS = (".glb", ".gltf", ".obj", ".ply", ".stl", ".fbx")
+BUNDLE_MAX_BYTES = 512 * 1024 * 1024
+
+
+def bundle_mesh(mesh_path: Path, out_dir: Path) -> Path:
+    """
+    The file to upload to a worker for this mesh.
+
+    A GLB carries its textures inside it and goes as it is. An OBJ does not:
+    its material and texture sit beside it, and uploading the OBJ alone gets
+    back an untextured .blend. Those go together as one zip.
+    """
+    if mesh_path.suffix.lower() != ".obj":
+        return mesh_path
+    bundle = out_dir / "mesh_bundle.zip"
+    with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as zf:
+        for item in mesh_path.parent.iterdir():
+            if item.is_file() and item != bundle:
+                zf.write(item, arcname=item.name)
+    return bundle
+
+
+def extract_mesh_bundle(bundle: Path, dest: Path) -> Path:
+    """Unpack a bundle from bundle_mesh() and return the mesh inside it."""
+    dest.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(bundle) as zf:
+        members = zf.infolist()
+        if sum(m.file_size for m in members) > BUNDLE_MAX_BYTES:
+            raise ValueError("mesh bundle is too large")
+        for member in members:
+            name = Path(member.filename)
+            if name.is_absolute() or ".." in name.parts or len(name.parts) != 1:
+                raise ValueError(f"unexpected path in mesh bundle: {member.filename}")
+        zf.extractall(dest)
+    meshes = sorted(
+        (p for p in dest.iterdir() if p.suffix.lower() in MESH_FILE_EXTENSIONS),
+        key=lambda p: MESH_FILE_EXTENSIONS.index(p.suffix.lower()),
+    )
+    if not meshes:
+        raise ValueError("mesh bundle contains no mesh file")
+    return meshes[0]
+
+
+def _fetch_worker_file(item: str, base_url: str, dest: Path) -> None:
+    """Gradio hands back either a local download or a path on the Space."""
+    src = Path(item)
+    if src.exists():
+        dest.write_bytes(src.read_bytes())
+        return
+    import urllib.request
+
+    url = item if item.startswith("http") else base_url.rstrip("/") + item
+    with urllib.request.urlopen(url, timeout=180) as resp:
+        dest.write_bytes(resp.read())
+
+
+def build_blend_via_worker(
+    mesh_path: Path,
+    out_dir: Path,
+    scene_json_path: Path | None,
+    image_path: str | None = None,
+    make_preview: bool = False,
+) -> BlendResult:
     """Delegate the build to a remote GenFX worker Space."""
     from gradio_client import handle_file
 
     from app.mesh_gen import make_gradio_client
 
-    client = make_gradio_client(config.BLEND_WORKER_URL)
+    client = make_gradio_client(config.BLEND_WORKER_URL, http_timeout=config.BLEND_TIMEOUT_SECONDS)
     scene_text = ""
     if scene_json_path and scene_json_path.exists():
         scene_text = scene_json_path.read_text(encoding="utf-8")
 
+    upload = bundle_mesh(mesh_path, out_dir)
     result = client.predict(
-        mesh_file=handle_file(str(mesh_path)),
+        mesh_file=handle_file(str(upload)),
         scene_json=scene_text,
+        image_file=handle_file(image_path) if image_path and os.path.exists(image_path) else None,
+        make_preview=bool(make_preview),
+        token=config.BLEND_WORKER_TOKEN,
         api_name="/build_blend",
     )
 
-    blend_src = None
-    for item in (result if isinstance(result, (list, tuple)) else [result]):
+    items = result if isinstance(result, (list, tuple)) else [result]
+    found: dict[str, str] = {}
+    message = ""
+    for item in items:
         candidate = item.get("value") if isinstance(item, dict) else item
-        if isinstance(candidate, str) and candidate.lower().endswith(".blend"):
-            blend_src = candidate
-            break
-    if not blend_src:
-        raise RuntimeError(f"worker returned no .blend: {str(result)[:200]}")
+        if not isinstance(candidate, str):
+            continue
+        low = candidate.lower().split("?")[0]
+        for ext in (".blend", ".glb", ".png"):
+            if low.endswith(ext):
+                found.setdefault(ext, candidate)
+                break
+        else:
+            message = candidate
+    if ".blend" not in found:
+        raise RuntimeError(f"worker returned no .blend: {message or str(result)[:200]}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    dest = out_dir / "scene.blend"
-    src = Path(blend_src)
-    if src.exists():
-        dest.write_bytes(src.read_bytes())
-    else:
-        import urllib.request
+    targets = {".blend": out_dir / "scene.blend", ".glb": out_dir / "preview.glb",
+               ".png": out_dir / "preview.png"}
+    fetched: dict[str, str] = {}
+    for ext, item in found.items():
+        try:
+            _fetch_worker_file(item, client.src, targets[ext])
+            fetched[ext] = str(targets[ext])
+        except Exception as exc:
+            if ext == ".blend":
+                raise
+            logger.warning("Could not fetch worker %s: %s", ext, str(exc)[:140])
 
-        url = blend_src if blend_src.startswith("http") else client.src.rstrip("/") + blend_src
-        with urllib.request.urlopen(url, timeout=180) as resp:
-            dest.write_bytes(resp.read())
-
-    return BlendResult(blend_path=str(dest), status="ok", runtime="worker")
+    return BlendResult(
+        blend_path=fetched[".blend"], status="ok", runtime="worker",
+        glb_path=fetched.get(".glb"), preview_path=fetched.get(".png"),
+    )
 
 
 def build_blend(
@@ -281,7 +368,10 @@ def build_blend(
     # 3) Remote worker
     if config.BLEND_WORKER_URL:
         try:
-            return build_blend_via_worker(mesh_path, out_dir, scene_json_path)
+            return build_blend_via_worker(
+                mesh_path, out_dir, scene_json_path,
+                image_path=image_path, make_preview=bool(preview_path),
+            )
         except Exception as exc:
             errors.append(f"worker: {type(exc).__name__} - {str(exc)[:160]}")
 

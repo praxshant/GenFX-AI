@@ -240,15 +240,6 @@ def build_heuristic_image_prompt(user_prompt: str) -> str:
     return f"{base}, single subject, studio product shot, {RECON_SUFFIX}"
 
 
-def load_fallback_json() -> dict:
-    """Load the pre-baked fallback scene, or rebuild it from the schema."""
-    try:
-        with open(config.FALLBACK_JSON_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return json.loads(SCENE_SCHEMA_EXAMPLE)
-
-
 # ── JSON extraction ───────────────────────────────────────────────────────────
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
@@ -366,7 +357,7 @@ def _parse_with_openrouter(user_prompt: str) -> str:
         {
             "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/praxshant/GenFX-Lite",
+            "HTTP-Referer": "https://github.com/praxshant/GenFX-AI",
             "X-Title": "GenFX",
         },
         config.OPENROUTER_MODEL,
@@ -459,21 +450,6 @@ def get_provider(name: str) -> Callable[[str], str] | None:
     """Resolve a provider by name at call time."""
     attr = PROVIDERS.get(name)
     return globals().get(attr) if attr else None
-
-
-def available_providers() -> list[str]:
-    """Providers that look configured, in cascade order."""
-    ready = []
-    for name in config.LLM_PROVIDER_ORDER:
-        if name == "openrouter" and config.OPENROUTER_API_KEY:
-            ready.append(name)
-        elif name == "openai" and config.OPENAI_API_KEY:
-            ready.append(name)
-        elif name == "huggingface" and config.HUGGINGFACE_API_KEY:
-            ready.append(name)
-        elif name == "ollama" and config.OLLAMA_ENABLED:
-            ready.append(name)
-    return ready
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

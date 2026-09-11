@@ -1,5 +1,63 @@
 # Changelog
 
+## 2.2.0
+
+The repository is now **GenFX-AI** (formerly GenFX-Lite).
+
+### Pipeline
+
+- **The image-to-3D Spaces have a time budget.** `GENFX_MESH_TIMEOUT` was
+  defined but never read, and `predict()` waits for as long as a Space's queue
+  does, which on an anonymous ZeroGPU quota can be indefinitely, holding the
+  page with it. Jobs are now submitted and given only what remains of one
+  budget shared by every Space, then cancelled.
+- **A placeholder image is never meshed.** When every image provider failed,
+  the placeholder went on to stage 3, came back as a solid "FALLBACK IMAGE"
+  sign, and the run was reported as a success. The mesh and `.blend` stages
+  are now skipped, each saying why, and the run is marked failed.
+- **An unconfigured image provider is not retried.** A missing key does not
+  appear between attempts; the retries only added about 4.5 s of sleep.
+- **The depth tier's Hugging Face call is gone.** `InferenceClient` has no
+  `depth_estimation` method, so it could only fail, silently. The local model is
+  now loaded once per process rather than on every run, and the optional
+  `transformers` + `torch` install is documented.
+- **A timed-out `bpy` probe is not cached.** A slow cold start used to report
+  "no Blender" for the life of the process.
+
+### Split deployment
+
+- **OBJ meshes reach the worker with their material and texture.** Only the
+  OBJ was uploaded, so every locally built mesh came back untextured. They now
+  travel as a zip, unpacked on the worker with path and size checks.
+- **The worker gets the reference image and returns the preview and `.glb`.**
+  The front end used to show no 3D preview for worker builds.
+- **`GENFX_WORKER_TOKEN`.** A worker with the token set refuses callers that do
+  not present it. Uploads are capped at 200 MB.
+
+### Front end
+
+- **"Recent" shows only your own runs.** The runs directory is shared, so on a
+  public deployment every visitor saw everyone else's prompts and downloads.
+  `GENFX_SHARED_GALLERY=1` restores the full list for a local install.
+- **The no-`.blend` message names the stage that failed** instead of always
+  blaming a missing Blender runtime.
+- **Tracebacks are no longer shown to visitors** (`showErrorDetails = false`),
+  and the `enableCORS = false` line, which XSRF protection overrides anyway, is
+  gone.
+
+### Housekeeping
+
+- `pytest` moved to `requirements-dev.txt`, out of the production image.
+- Removed the unused `load_fallback_json`, `available_providers`,
+  `fallback_scene.json` and `fallback_render.png`.
+
+### Tests
+
+79 → 88: Space budget and cancellation, placeholder not meshed, no retries for
+unconfigured providers, OBJ bundles (including a path-traversal attempt), the
+worker hand-off carrying texture, image and token, the uncached `bpy` timeout,
+and a gallery limited to one visitor's runs.
+
 ## 2.1.0
 
 A correctness pass over the geometry and the Blender hand-off. Nothing here

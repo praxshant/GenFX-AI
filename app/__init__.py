@@ -1,1 +1,1 @@
-# GenFX Lite — app package
+# GenFX — app package

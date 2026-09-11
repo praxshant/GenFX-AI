@@ -50,9 +50,7 @@ BLENDER_DIR = PROJECT_ROOT / "blender"
 # working directory.
 RUNS_DIR = Path(os.getenv("GENFX_RUNS_DIR", str(PROJECT_ROOT / "runs"))).expanduser().resolve()
 
-FALLBACK_JSON_PATH = ASSETS_DIR / "fallback_scene.json"
 FALLBACK_IMAGE_PATH = ASSETS_DIR / "fallback_image.png"
-FALLBACK_RENDER_PATH = ASSETS_DIR / "fallback_render.png"
 
 BLEND_BUILDER_SCRIPT = BLENDER_DIR / "build_blend.py"
 
@@ -122,6 +120,8 @@ MESH_SPACES = [
     if s.strip()
 ]
 
+# Total budget for the whole Space tier, shared across every Space tried. A
+# queued ZeroGPU job can otherwise wait indefinitely and hold the page with it.
 MESH_SPACE_TIMEOUT = _env_int("GENFX_MESH_TIMEOUT", 300)
 MESH_TARGET_FACES = _env_int("GENFX_MESH_TARGET_FACES", 30000)
 MESH_OCTREE_RESOLUTION = _env_int("GENFX_MESH_OCTREE", 256)
@@ -149,6 +149,9 @@ BLEND_PREVIEW_SAMPLES = _env_int("GENFX_PREVIEW_SAMPLES", 16)
 # Remote worker: when set, .blend building is delegated to another deployment
 # (a Gradio Space or any GenFX worker) instead of running bpy in this process.
 BLEND_WORKER_URL = os.getenv("GENFX_BLEND_WORKER", "").strip()
+# Shared secret between front end and worker. When set on the worker, requests
+# without it are refused; the front end sends it with every build.
+BLEND_WORKER_TOKEN = os.getenv("GENFX_WORKER_TOKEN", "").strip()
 
 # ── Retries & timeouts ────────────────────────────────────────────────────────
 LLM_RETRY_COUNT = _env_int("GENFX_LLM_RETRIES", 1)
@@ -158,7 +161,11 @@ IMAGE_TIMEOUT_SECONDS = _env_int("GENFX_IMAGE_TIMEOUT", 120)
 
 # ── Housekeeping ──────────────────────────────────────────────────────────────
 MAX_RUNS_KEPT = _env_int("GENFX_MAX_RUNS", 40)
-APP_VERSION = "2.1.0"
+# Off by default: on a public deployment the runs directory is shared, and a
+# gallery of it shows every visitor everyone else's prompts and downloads.
+# Turn it on for a single-user local install.
+SHARED_GALLERY = _env_bool("GENFX_SHARED_GALLERY", False)
+APP_VERSION = "2.2.0"
 
 
 def summary() -> dict[str, object]:

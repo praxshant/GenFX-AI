@@ -1,12 +1,11 @@
 """
-Script to generate fallback placeholder PNG assets for GenFX Lite.
+Generate the placeholder shown when every image provider fails.
 Run once before launching the app: python create_fallback_assets.py
 Requires Pillow (pip install Pillow).
 """
 
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
-import os
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
@@ -68,7 +67,7 @@ def make_gradient_image(label: str, output_path: Path) -> None:
     draw.text(((W - lw) // 2, (H - lh) // 2 - 10), label, fill=label_color, font=font_large)
 
     # Sub-caption
-    sub = "GENFX LITE  ·  FALLBACK ASSET"
+    sub = "GENFX  ·  FALLBACK ASSET"
     sbbox = draw.textbbox((0, 0), sub, font=font_small)
     sw = sbbox[2] - sbbox[0]
     draw.text(((W - sw) // 2, (H // 2) + 22), sub, fill=muted_color, font=font_small)
@@ -83,5 +82,3 @@ def make_gradient_image(label: str, output_path: Path) -> None:
 
 if __name__ == "__main__":
     make_gradient_image("FALLBACK IMAGE", ASSETS_DIR / "fallback_image.png")
-    make_gradient_image("FALLBACK RENDER", ASSETS_DIR / "fallback_render.png")
-    print("Fallback assets created successfully.")

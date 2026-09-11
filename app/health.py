@@ -120,13 +120,10 @@ def check_blend() -> dict[str, Any]:
 
 
 def check_assets() -> dict[str, Any]:
-    missing = [
-        p.name
-        for p in (config.FALLBACK_JSON_PATH, config.FALLBACK_IMAGE_PATH, config.FALLBACK_RENDER_PATH)
-        if not p.exists()
-    ]
-    if missing:
-        return _bad(f"missing: {', '.join(missing)}", "run python create_fallback_assets.py")
+    if not config.FALLBACK_IMAGE_PATH.exists():
+        return _bad(
+            f"missing: {config.FALLBACK_IMAGE_PATH.name}", "run python create_fallback_assets.py"
+        )
     return _ok("fallback assets present")
 
 

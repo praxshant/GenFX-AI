@@ -35,8 +35,8 @@ Every run lands in `runs/run_<id>/`.
 ## Quick start
 
 ```bash
-git clone https://github.com/praxshant/GenFX-Lite.git
-cd GenFX-Lite
+git clone https://github.com/praxshant/GenFX-AI.git
+cd GenFX-AI
 
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -90,11 +90,18 @@ background — which is also why the system prompt asks for exactly that.
 
 ### 3 · Image → 3D mesh
 
+If stage 2 could not produce a real image, this stage and the next are skipped
+and the run is reported as failed. Reconstructing the placeholder would hand
+you a solid "FALLBACK IMAGE" sign and call it a success.
+
 1. **Hosted image-to-3D** — Hunyuan3D and TRELLIS, called through public
    Hugging Face Spaces. Real geometry: ~30k polygons in 15–25 seconds. Free;
-   an HF token raises the ZeroGPU quota and unlocks textured pipelines.
+   an HF token raises the ZeroGPU quota and unlocks textured pipelines. All
+   Spaces together get `GENFX_MESH_TIMEOUT` seconds (default 300); a job
+   still queued when that runs out is cancelled and the next tier takes over.
 2. **Depth-displaced solid** — monocular depth (Depth Anything V2) shaping a
-   textured mesh. Used when a Space is down and `transformers` is available.
+   textured mesh. Used when a Space is down and the optional
+   `transformers` + `torch` are installed (`pip install transformers torch`).
 3. **Inflated silhouette** — the subject is segmented from its background and
    inflated with a distance transform into a closed, textured solid. Pure
    NumPy, no model, no key, no network. This one always works.
@@ -164,8 +171,15 @@ Free and simple, but memory is tight and the Python version is not always 3.11.
 Deploy the front end there and offload the heavy stage:
 
 1. Deploy the worker: `./deploy/deploy.sh <username> genfx-blend-worker worker`
-2. In the Streamlit app's secrets, set
-   `GENFX_BLEND_WORKER = "https://<username>-genfx-blend-worker.hf.space"`
+2. Pick a long random secret and set it as `GENFX_WORKER_TOKEN` on the worker
+   Space. Without it, anyone who finds the worker can make it run Blender.
+3. In the Streamlit app's secrets, set
+   `GENFX_BLEND_WORKER = "https://<username>-genfx-blend-worker.hf.space"` and
+   the same `GENFX_WORKER_TOKEN`.
+
+An OBJ mesh is zipped with its material and texture for the trip, so the
+worker's `.blend` is textured, and the worker sends back the preview render
+and `.glb` along with it.
 
 This is the split ("distributed") deployment: a light front end anywhere, the
 Blender stage on hardware that can carry it. The same trick works for Render,
@@ -193,8 +207,11 @@ that change the most:
 | `MESH_PROVIDER_ORDER` | `space,depth,relief` | Force offline meshing with `relief` |
 | `GENFX_MESH_SPACES` | 3 Spaces | Swap in your own image-to-3D Space |
 | `BLENDER_PATH` | `blender` | Use a real Blender install |
+| `GENFX_MESH_TIMEOUT` | `300` | Total seconds the image-to-3D Spaces may take |
 | `GENFX_BLEND_WORKER` | *(none)* | Split deployment |
+| `GENFX_WORKER_TOKEN` | *(none)* | Shared secret between front end and worker |
 | `GENFX_RUNS_DIR` | `./runs` | Persistent storage path |
+| `GENFX_SHARED_GALLERY` | `0` | `1` shows every run in "Recent" — fine locally, not on a public deployment |
 
 ---
 
@@ -216,7 +233,7 @@ ui/
 worker/
   app.py            Optional Gradio worker for split deployments
 deploy/             Space cards, worker Dockerfile, deploy script
-tests/              79 tests, no keys, no network, no Blender required
+tests/              88 tests, no keys, no network, no Blender required
 ```
 
 ---
@@ -224,7 +241,8 @@ tests/              79 tests, no keys, no network, no Blender required
 ## Tests
 
 ```bash
-pytest -q          # 79 passed
+pip install -r requirements-dev.txt
+pytest -q          # 88 tests; the 3 Blender integration tests skip without a runtime
 ```
 
 Offline by design: no API keys, no network, no Blender. The tests that need a

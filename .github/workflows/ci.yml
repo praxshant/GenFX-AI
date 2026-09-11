@@ -16,6 +16,7 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: requirements*.txt
 
       # bpy links against these even when running headless.
       - name: Install Blender runtime libraries
@@ -29,7 +30,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
 
       - name: Generate fallback assets
         run: python create_fallback_assets.py
