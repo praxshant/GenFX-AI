@@ -9,6 +9,7 @@ need a real Blender runtime are skipped rather than failed.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import sys
@@ -246,6 +247,115 @@ class TestProviderCascade:
 
         assert result.status == "fallback"
         assert "invalid JSON" in (result.error_message or "")
+
+    @staticmethod
+    def _http(status: int, body: dict | None = None) -> MagicMock:
+        resp = MagicMock()
+        resp.status_code = status
+        resp.text = json.dumps(body or {})
+        resp.json.return_value = body or {}
+        if status >= 400:
+            import requests
+
+            resp.raise_for_status.side_effect = requests.HTTPError(f"HTTP {status}")
+        else:
+            resp.raise_for_status.return_value = None
+        return resp
+
+    def _keys_everywhere(self):
+        return (
+            patch.object(config, "LLM_PROVIDER_ORDER", ["openrouter", "openai", "huggingface", "ollama"]),
+            patch.object(config, "OPENROUTER_API_KEY", "sk-or-bad"),
+            patch.object(config, "OPENAI_API_KEY", "sk-bad"),
+            patch.object(config, "HUGGINGFACE_API_KEY", "hf_bad"),
+            patch.object(config, "OLLAMA_ENABLED", True),
+            patch.object(config, "OLLAMA_MODEL", "llama3.2"),
+            patch.object(config, "LLM_RETRY_COUNT", 2),
+        )
+
+    def test_every_key_rejected_lands_on_ollama(self):
+        """
+        The case this cascade exists for: keys are set but none works. Each
+        keyed provider gets one call - a 401 will not change on retry - and
+        the local Ollama daemon answers.
+        """
+        scene = normalise_scene({}, "a lamp")
+        posted: list[str] = []
+
+        def post(url, **_kwargs):
+            posted.append(url)
+            if "11434" in url:
+                return self._http(200, {"message": {"content": json.dumps(scene)}})
+            return self._http(401, {"error": "invalid key"})
+
+        tags = self._http(200, {"models": [{"name": "llama3.2:latest"}]})
+        with contextlib.ExitStack() as stack:
+            for p in self._keys_everywhere():
+                stack.enter_context(p)
+            stack.enter_context(patch("requests.post", side_effect=post))
+            stack.enter_context(patch("requests.get", return_value=tags))
+            result = parse_prompt("a lamp")
+
+        assert result.status == "ok"
+        assert result.provider_used == "ollama"
+        keyed = [u for u in posted if "11434" not in u]
+        assert len(keyed) == 3, f"rejected keys were retried: {keyed}"
+        assert any("key rejected" in a for a in result.attempts)
+
+    def test_every_key_rejected_and_no_ollama_uses_the_local_parser(self):
+        """No working key and no Ollama on the machine: still a usable scene."""
+        with contextlib.ExitStack() as stack:
+            for p in self._keys_everywhere():
+                stack.enter_context(p)
+            stack.enter_context(patch("requests.post", return_value=self._http(401)))
+            stack.enter_context(patch("requests.get", side_effect=OSError("connection refused")))
+            result = parse_prompt("a lamp")
+
+        assert result.status == "fallback"
+        assert result.provider_used == "local_heuristic"
+        assert validate_schema(result.scene_json) is True
+        assert [a.split(":")[0] for a in result.attempts] == [
+            "openrouter", "openai", "huggingface", "ollama",
+        ]
+        assert "Ollama not reachable" in result.error_message
+
+    def test_a_server_error_is_still_retried(self):
+        """Unlike a rejected key, a 503 may clear up on the next attempt."""
+        calls = []
+
+        def post(url, **_kwargs):
+            calls.append(url)
+            return self._http(503)
+
+        with patch.object(config, "LLM_PROVIDER_ORDER", ["openai"]), \
+             patch.object(config, "OPENAI_API_KEY", "sk-x"), \
+             patch.object(config, "LLM_RETRY_COUNT", 2), \
+             patch("requests.post", side_effect=post):
+            parse_prompt("a lamp")
+
+        assert len(calls) == 3
+
+    @pytest.mark.parametrize("model, installed, expected", [
+        ("llama3.2", {"llama3.2:latest"}, True),
+        ("llama3.2", {"llama3.2:3b"}, True),
+        ("llama3.2:1b", {"llama3.2:3b"}, False),
+        ("llama3.2:1b", {"llama3.2:1b"}, True),
+        ("llama3.2", set(), False),
+        ("llama3.2", {"llama3.1:latest"}, False),
+    ])
+    def test_ollama_model_matching(self, model, installed, expected):
+        from app.llm_parser import _ollama_has_model
+
+        assert _ollama_has_model(model, installed) is expected
+
+    def test_ollama_with_nothing_pulled_is_unavailable(self):
+        from app.llm_parser import _parse_with_ollama
+
+        with patch("requests.get", return_value=self._http(200, {"models": []})), \
+             patch("requests.post") as post:
+            with pytest.raises(ProviderUnavailable, match="not pulled"):
+                _parse_with_ollama("a lamp")
+        post.assert_not_called()
 
     def test_ollama_reports_unavailable_when_daemon_is_absent(self):
         from app.llm_parser import _parse_with_ollama
@@ -1122,6 +1232,30 @@ class TestHealth:
 
         assert probe["ok"] is False
         assert "heuristic" in probe["detail"]
+
+    def test_llm_probe_follows_the_cascade_past_a_bad_key(self):
+        """A rejected OpenRouter key is a fallback, not a dead end, if Ollama is up."""
+        from app.health import check_llm
+
+        def get(url, **_kwargs):
+            resp = MagicMock()
+            if "openrouter" in url:
+                resp.status_code = 401
+            else:
+                resp.status_code = 200
+                resp.json.return_value = {"models": [{"name": "llama3.2:latest"}]}
+            return resp
+
+        with patch.object(config, "LLM_PROVIDER_ORDER", ["openrouter", "ollama"]), \
+             patch.object(config, "OPENROUTER_API_KEY", "sk-or-bad"), \
+             patch.object(config, "OLLAMA_ENABLED", True), \
+             patch.object(config, "OLLAMA_MODEL", "llama3.2"), \
+             patch("app.health.requests.get", side_effect=get):
+            probe = check_llm()
+
+        assert probe["ok"] is True
+        assert "Ollama" in probe["detail"]
+        assert "OpenRouter HTTP 401" in probe["detail"]
 
     def test_assets_probe_passes_on_a_fresh_checkout(self):
         from app.health import check_assets

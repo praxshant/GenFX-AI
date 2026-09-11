@@ -23,6 +23,16 @@ The repository is now **GenFX-AI** (formerly GenFX-Lite).
   `transformers` + `torch` install is documented.
 - **A timed-out `bpy` probe is not cached.** A slow cold start used to report
   "no Blender" for the life of the process.
+- **A rejected key hands straight on to the next LLM.** A 401, 402, 403 or 404
+  used to be retried, though it says the same thing every time; the cascade now
+  moves on to the next provider and, in the end, Ollama. 429 and 5xx are still
+  retried.
+- **Ollama with nothing pulled is skipped**, instead of being sent a chat
+  request that can only fail, and `llama3.2:1b` no longer matches a machine
+  that only has `llama3.2:3b`.
+- **The sidebar's LLM check follows the cascade.** It looked at the first key
+  only, so a bad OpenRouter key showed red even with a working fallback, and it
+  ignored `LLM_PROVIDER_ORDER`.
 
 ### Split deployment
 
@@ -53,10 +63,12 @@ The repository is now **GenFX-AI** (formerly GenFX-Lite).
 
 ### Tests
 
-79 → 88: Space budget and cancellation, placeholder not meshed, no retries for
+79 → 99: Space budget and cancellation, placeholder not meshed, no retries for
 unconfigured providers, OBJ bundles (including a path-traversal attempt), the
 worker hand-off carrying texture, image and token, the uncached `bpy` timeout,
-and a gallery limited to one visitor's runs.
+a gallery limited to one visitor's runs, and the full LLM cascade over fake
+HTTP: every key rejected lands on Ollama, and with no Ollama on the local
+parser.
 
 ## 2.1.0
 

@@ -28,37 +28,69 @@ def _bad(error: str, detail: str = "") -> dict[str, Any]:
     return {"ok": False, "detail": detail, "error": error}
 
 
-def check_llm() -> dict[str, Any]:
-    """Which parser provider is reachable, without spending a completion."""
-    if config.OPENROUTER_API_KEY:
-        try:
-            resp = requests.get(
-                "https://openrouter.ai/api/v1/key",
-                headers={"Authorization": f"Bearer {config.OPENROUTER_API_KEY}"},
-                timeout=TIMEOUT,
-            )
-            if resp.status_code == 200:
-                return _ok(f"OpenRouter · {config.OPENROUTER_MODEL}")
-            return _bad(f"OpenRouter HTTP {resp.status_code}")
-        except Exception as exc:
-            return _bad(f"OpenRouter unreachable: {str(exc)[:80]}")
+def _key_probe(url: str, key: str) -> str | None:
+    """None when the key is accepted, else a short reason. Spends no tokens."""
+    try:
+        resp = requests.get(url, headers={"Authorization": f"Bearer {key}"}, timeout=TIMEOUT)
+    except Exception as exc:
+        return f"unreachable: {str(exc)[:60]}"
+    return None if resp.status_code == 200 else f"HTTP {resp.status_code}"
 
-    if config.OPENAI_API_KEY:
-        return _ok(f"OpenAI · {config.OPENAI_MODEL}")
 
-    if config.HUGGINGFACE_API_KEY:
-        return _ok(f"HuggingFace · {config.HF_LLM_MODEL}")
+def _probe_llm(name: str) -> tuple[str | None, str | None]:
+    """(label if usable, reason if not) for one provider in the cascade."""
+    if name == "openrouter":
+        if not config.OPENROUTER_API_KEY:
+            return None, None
+        why = _key_probe("https://openrouter.ai/api/v1/key", config.OPENROUTER_API_KEY)
+        return (None, f"OpenRouter {why}") if why else (f"OpenRouter · {config.OPENROUTER_MODEL}", None)
 
-    if config.OLLAMA_ENABLED:
+    if name == "openai":
+        if not config.OPENAI_API_KEY:
+            return None, None
+        why = _key_probe("https://api.openai.com/v1/models", config.OPENAI_API_KEY)
+        return (None, f"OpenAI {why}") if why else (f"OpenAI · {config.OPENAI_MODEL}", None)
+
+    if name == "huggingface":
+        if not config.HUGGINGFACE_API_KEY:
+            return None, None
+        why = _key_probe("https://huggingface.co/api/whoami-v2", config.HUGGINGFACE_API_KEY)
+        return (None, f"HuggingFace {why}") if why else (f"HuggingFace · {config.HF_LLM_MODEL}", None)
+
+    if name == "ollama":
+        if not config.OLLAMA_ENABLED:
+            return None, None
+        from app.llm_parser import _ollama_has_model
+
         try:
             resp = requests.get(f"{config.OLLAMA_HOST}/api/tags", timeout=3)
-            if resp.status_code == 200:
-                models = [m.get("name") for m in resp.json().get("models", [])][:3]
-                return _ok(f"Ollama · {', '.join(models) or config.OLLAMA_MODEL}")
+            installed = {m.get("name", "") for m in resp.json().get("models", [])}
         except Exception:
-            pass
+            return None, "Ollama not running"
+        if not _ollama_has_model(config.OLLAMA_MODEL, installed):
+            return None, f"Ollama has no '{config.OLLAMA_MODEL}'"
+        return f"Ollama · {config.OLLAMA_MODEL}", None
 
-    return _bad("No LLM provider configured", "local heuristic parser will be used")
+    return None, None
+
+
+def check_llm() -> dict[str, Any]:
+    """
+    The provider the parser will actually land on, walking the same cascade it
+    does - so a rejected key upstream shows as a fallback, not a dead end.
+    """
+    skipped: list[str] = []
+    for name in config.LLM_PROVIDER_ORDER:
+        label, why = _probe_llm(name)
+        if label:
+            return _ok(label + (f" (after: {'; '.join(skipped)})" if skipped else ""))
+        if why:
+            skipped.append(why)
+
+    detail = "local heuristic parser will be used"
+    if skipped:
+        return _bad("; ".join(skipped), detail)
+    return _bad("No LLM provider configured", detail)
 
 
 def check_image() -> dict[str, Any]:

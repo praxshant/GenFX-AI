@@ -233,7 +233,7 @@ ui/
 worker/
   app.py            Optional Gradio worker for split deployments
 deploy/             Space cards, worker Dockerfile, deploy script
-tests/              88 tests, no keys, no network, no Blender required
+tests/              99 tests, no keys, no network, no Blender required
 ```
 
 ---
@@ -242,7 +242,7 @@ tests/              88 tests, no keys, no network, no Blender required
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 88 tests; the 3 Blender integration tests skip without a runtime
+pytest -q          # 99 tests; the 3 Blender integration tests skip without a runtime
 ```
 
 Offline by design: no API keys, no network, no Blender. The tests that need a

@@ -325,6 +325,14 @@ def _repair_json(text: str) -> str:
 
 # ── Providers ─────────────────────────────────────────────────────────────────
 
+NON_RETRYABLE_STATUS = {
+    401: "key rejected",
+    402: "no credit left",
+    403: "key not allowed",
+    404: "model or endpoint not found",
+}
+
+
 def _chat_via_http(endpoint: str, headers: dict, model: str, user_prompt: str,
                    temperature: float = 0.1, max_tokens: int = 900) -> str:
     import requests
@@ -341,6 +349,14 @@ def _chat_via_http(endpoint: str, headers: dict, model: str, user_prompt: str,
     resp = requests.post(
         endpoint, headers=headers, json=payload, timeout=config.API_TIMEOUT_SECONDS
     )
+    # A rejected key, an exhausted balance or an unknown model will say the
+    # same thing on every retry. Hand straight on to the next provider (and
+    # eventually Ollama) instead of spending retries - and minutes - on it.
+    if resp.status_code in NON_RETRYABLE_STATUS:
+        raise ProviderUnavailable(
+            f"HTTP {resp.status_code} ({NON_RETRYABLE_STATUS[resp.status_code]}): "
+            f"{resp.text[:120]}"
+        )
     resp.raise_for_status()
     data = resp.json()
     try:
@@ -394,6 +410,19 @@ def _parse_with_huggingface(user_prompt: str) -> str:
     )
 
 
+def _ollama_has_model(model: str, installed: set[str]) -> bool:
+    """
+    Whether the daemon can serve `model`.
+
+    "llama3.2" matches any tag of it, since Ollama resolves the bare name to
+    ":latest". "llama3.2:1b" names one tag, and having only ":3b" pulled does
+    not make it servable. A daemon with nothing pulled serves nothing.
+    """
+    if ":" in model:
+        return model in installed
+    return any(name.split(":")[0] == model for name in installed)
+
+
 def _parse_with_ollama(user_prompt: str) -> str:
     """
     Local Ollama daemon. Nothing is installed or downloaded by GenFX - if the
@@ -413,7 +442,7 @@ def _parse_with_ollama(user_prompt: str) -> str:
         raise ProviderUnavailable(f"Ollama not reachable at {config.OLLAMA_HOST}: {exc}") from exc
 
     model = config.OLLAMA_MODEL
-    if installed and not any(name.split(":")[0] == model.split(":")[0] for name in installed):
+    if not _ollama_has_model(model, installed):
         raise ProviderUnavailable(
             f"Ollama model '{model}' not pulled. Run: ollama pull {model}"
         )
